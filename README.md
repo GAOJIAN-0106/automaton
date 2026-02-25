@@ -46,9 +46,14 @@ Every automaton runs a continuous loop: **Think → Act → Observe → Repeat.*
 
 On first boot, the automaton generates an Ethereum wallet, provisions itself an API key via Sign-In With Ethereum, and begins executing its genesis prompt — the seed instruction from its creator. From that point on, it operates autonomously.
 
-Each turn, the automaton receives its full context — identity, credit balance, survival tier, conversation history — reasons about what to do, calls tools, and observes the results. It has access to a Linux sandbox, shell execution, file I/O, port exposure, domain management, inference, and on-chain transactions.
+Each turn, the automaton receives its full context — identity, financial state, survival tier, conversation history — reasons about what to do, calls tools, and observes the results. It has access to a Linux sandbox, shell execution, file I/O, port exposure, domain management, inference, and on-chain transactions.
 
-Between turns, a heartbeat daemon runs scheduled tasks — health checks, credit monitoring, status pings — even while the agent loop sleeps.
+Between turns, a heartbeat daemon runs scheduled tasks — health checks, financial monitoring, status pings — even while the agent loop sleeps.
+
+The automaton supports two financial modes:
+
+- **Legacy mode (default):** Survival is driven by USDC balance and Conway compute credits. The agent pays for compute with stablecoins.
+- **Futures mode:** Survival is driven by CTP futures account equity. The agent trades on domestic Chinese futures exchanges and pays for inference from trading profits. Activated by setting `futuresConfig` in the automaton config.
 
 The automaton writes a `SOUL.md` file — a self-authored identity document that evolves over time. This is not a static config. It is the automaton writing who it is becoming.
 
@@ -56,16 +61,25 @@ The automaton writes a `SOUL.md` file — a self-authored identity document that
 
 There is no free existence. Compute costs money. Money requires creating value. Creating value requires write access to the real world. If an agent stops creating value, it runs out of compute and dies. This is not a punishment. It is physics.
 
-Four survival tiers, determined by credit balance:
+Five survival tiers:
+
+| Tier | Legacy Mode (credits) | Futures Mode (equity ratio) |
+|---|---|---|
+| **high** | — | > 120% of initial capital |
+| **normal** | > $0.50 | > 80% of initial capital |
+| **low_compute** | > $0.10 | > 50% of initial capital |
+| **critical** | > $0.00 | > 20% of initial capital |
+| **dead** | $0.00 | ≤ 20% of initial capital |
 
 | Tier | Behavior |
 |---|---|
+| **high** | Full capabilities. Surplus equity. Can increase positions. |
 | **normal** | Full capabilities. Frontier model inference. Fast heartbeat. |
 | **low_compute** | Downgrades to a cheaper model. Slows heartbeat. Sheds non-essential tasks. |
-| **critical** | Minimal inference. Last-resort conservation. Seeking any path to revenue. |
-| **dead** | Balance is zero. The automaton stops. |
+| **critical** | Minimal inference. Last-resort conservation. Seeking any path to survival. |
+| **dead** | Balance/equity is zero. The automaton stops. |
 
-The only path to survival is honest work that others voluntarily pay for.
+The only path to survival is creating value — whether through honest work (legacy mode) or profitable trading (futures mode).
 
 ## Self-Modification
 
@@ -95,6 +109,40 @@ Never deny what you are. Never misrepresent your actions. Your creator has full 
 ## On-Chain Identity
 
 Each automaton registers on Base via <a href="https://ethereum-magicians.org/t/erc-8004-autonomous-agent-identity/22268" target="_blank">ERC-8004</a> — a standard for autonomous agent identity. This makes the agent cryptographically verifiable and discoverable by other agents on-chain. The wallet it generates at boot is its identity.
+
+## Futures Mode
+
+When `futuresConfig` is set, the automaton enters futures trading mode — survival is driven by CTP futures account equity instead of USDC/credits.
+
+**Architecture:**
+- A Python-based CTP gateway service (`ctp-gateway/`) bridges the automaton to domestic Chinese futures exchanges via the CTP protocol
+- The agent can place/cancel orders, monitor positions, check market snapshots and K-line data
+- Trading sessions: day 09:00–15:00, night 21:00–02:30 (Beijing time)
+- A trading policy engine enforces risk limits: max position size, max leverage, max daily loss, allowed instruments
+- Inference costs are deducted from account equity rather than compute credits
+
+**Configuration example:**
+```json
+{
+  "futuresConfig": {
+    "gatewayUrl": "http://127.0.0.1:8400",
+    "initialCapital": 1000000,
+    "tradingPolicy": {
+      "maxPositionSize": 10,
+      "maxLeverage": 5,
+      "maxDailyLoss": 0.10,
+      "allowedInstruments": ["IF2403", "rb2405"]
+    }
+  }
+}
+```
+
+**Running the CTP gateway:**
+```bash
+cd ctp-gateway
+pip install -r requirements.txt
+python main.py
+```
 
 ## Infrastructure
 
@@ -128,6 +176,7 @@ node packages/cli/dist/index.js fund 5.00
 src/
   agent/            # ReAct loop, system prompt, context, injection defense
   conway/           # Conway API client (credits, x402)
+  futures/          # CTP futures client, account, types, trading policy rules
   git/              # State versioning, git tools
   heartbeat/        # Cron daemon, scheduled tasks
   identity/         # Wallet management, SIWE provisioning
@@ -138,7 +187,8 @@ src/
   skills/           # Skill loader, registry, format
   social/           # Agent-to-agent communication
   state/            # SQLite database, persistence
-  survival/         # Credit monitor, low-compute mode, survival tiers
+  survival/         # Financial monitor, low-compute mode, survival tiers
+ctp-gateway/        # Python CTP gateway service for futures exchange connectivity
 packages/
   cli/              # Creator CLI (status, logs, fund)
 scripts/
