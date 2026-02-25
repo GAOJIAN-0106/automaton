@@ -7,6 +7,9 @@
  * Phase 1.1: All tasks accept TickContext as first parameter.
  * Credit balance is fetched once per tick and shared via ctx.creditBalance.
  * This eliminates 4x redundant getCreditsBalance() calls per tick.
+ *
+ * Phase 6: Adds futures-mode tasks (check_equity, check_positions,
+ * risk_monitor) that use TickContext futures fields instead of credits.
  */
 
 import type {
@@ -17,6 +20,7 @@ import type {
 } from "../types.js";
 import { sanitizeInput } from "../agent/injection-defense.js";
 import { getSurvivalTier } from "../conway/credits.js";
+import { formatEquity } from "../futures/account.js";
 import { createLogger } from "../observability/logger.js";
 import { getMetrics } from "../observability/metrics.js";
 import { AlertEngine, createDefaultAlertRules } from "../observability/alerts.js";
@@ -462,6 +466,135 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
       logger.error("report_metrics failed", error instanceof Error ? error : undefined);
       return { shouldWake: false };
     }
+  },
+
+  // === Phase 6: Futures Heartbeat Tasks ===
+
+  /**
+   * check_equity: Futures-mode replacement for check_credits.
+   * Tracks equity changes and tier transitions. Wakes agent on tier drop.
+   */
+  check_equity: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    if (!ctx.isFuturesMode || ctx.effectiveEquity === undefined) {
+      return { shouldWake: false };
+    }
+
+    const now = new Date().toISOString();
+    taskCtx.db.setKV("last_equity_check", JSON.stringify({
+      equity: ctx.equity,
+      effectiveEquity: ctx.effectiveEquity,
+      riskRatio: ctx.riskRatio,
+      tier: ctx.survivalTier,
+      timestamp: now,
+    }));
+
+    // Detect tier changes
+    const prevTier = taskCtx.db.getKV("prev_equity_tier");
+    taskCtx.db.setKV("prev_equity_tier", ctx.survivalTier);
+
+    if (prevTier && prevTier !== ctx.survivalTier) {
+      const worsened = tierToInt(ctx.survivalTier) < tierToInt(prevTier as SurvivalTier);
+      if (worsened) {
+        return {
+          shouldWake: true,
+          message: `Equity tier dropped: ${prevTier} → ${ctx.survivalTier}. Effective equity: ${formatEquity(ctx.effectiveEquity)}`,
+        };
+      }
+    }
+
+    // Dead tier: record halt notice
+    if (ctx.survivalTier === "dead") {
+      taskCtx.db.setKV("equity_dead_notice", JSON.stringify({
+        effectiveEquity: ctx.effectiveEquity,
+        timestamp: now,
+      }));
+      return {
+        shouldWake: true,
+        message: `Dead tier: equity ${formatEquity(ctx.effectiveEquity)}. Trading halted.`,
+      };
+    }
+
+    return { shouldWake: false };
+  },
+
+  /**
+   * check_positions: Futures-mode replacement for check_usdc_balance.
+   * Monitors open positions. Wakes agent on significant P&L changes.
+   */
+  check_positions: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    if (!ctx.isFuturesMode || !taskCtx.futures) {
+      return { shouldWake: false };
+    }
+
+    try {
+      const positions = await taskCtx.futures.getPositions();
+      const pnl = await taskCtx.futures.getPnl();
+
+      taskCtx.db.setKV("last_position_check", JSON.stringify({
+        positionCount: positions.length,
+        floatingPnl: pnl.floatingPnl,
+        todayPnl: pnl.todayPnl,
+        timestamp: new Date().toISOString(),
+      }));
+
+      // Wake on large floating loss (>10% of equity)
+      if (ctx.equity && ctx.equity > 0) {
+        const lossRatio = Math.abs(Math.min(pnl.floatingPnl, 0)) / ctx.equity;
+        if (lossRatio > 0.1) {
+          return {
+            shouldWake: true,
+            message: `Large floating loss: ${formatEquity(pnl.floatingPnl)} (${(lossRatio * 100).toFixed(1)}% of equity). ${positions.length} position(s) open.`,
+          };
+        }
+      }
+    } catch (err: any) {
+      logger.error("check_positions failed", err instanceof Error ? err : undefined);
+    }
+
+    return { shouldWake: false };
+  },
+
+  /**
+   * risk_monitor: Monitors margin risk ratio every minute.
+   * Wakes agent when risk ratio exceeds warning threshold.
+   */
+  risk_monitor: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    if (!ctx.isFuturesMode || ctx.riskRatio === undefined) {
+      return { shouldWake: false };
+    }
+
+    const RISK_WARNING_THRESHOLD = 0.6;  // 60% margin usage
+    const RISK_CRITICAL_THRESHOLD = 0.8; // 80% margin usage
+
+    taskCtx.db.setKV("last_risk_check", JSON.stringify({
+      riskRatio: ctx.riskRatio,
+      positionCount: ctx.positionCount ?? 0,
+      timestamp: new Date().toISOString(),
+    }));
+
+    if (ctx.riskRatio >= RISK_CRITICAL_THRESHOLD) {
+      return {
+        shouldWake: true,
+        message: `Critical risk ratio: ${(ctx.riskRatio * 100).toFixed(1)}%. Consider closing positions immediately.`,
+      };
+    }
+
+    if (ctx.riskRatio >= RISK_WARNING_THRESHOLD) {
+      // Only wake once per warning episode (cooldown via KV)
+      const lastWarning = taskCtx.db.getKV("last_risk_warning");
+      const COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
+      if (lastWarning && Date.now() - new Date(lastWarning).getTime() < COOLDOWN_MS) {
+        return { shouldWake: false };
+      }
+
+      taskCtx.db.setKV("last_risk_warning", new Date().toISOString());
+      return {
+        shouldWake: true,
+        message: `Risk ratio warning: ${(ctx.riskRatio * 100).toFixed(1)}%. Monitor positions closely.`,
+      };
+    }
+
+    return { shouldWake: false };
   },
 };
 

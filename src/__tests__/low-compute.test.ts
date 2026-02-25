@@ -3,9 +3,12 @@ import {
   canRunInference,
   getModelForTier,
   applyTierRestrictions,
+  applyFuturesTierRestrictions,
 } from "../survival/low-compute.js";
 import { createInferenceClient } from "../conway/inference.js";
 import type { SurvivalTier } from "../types.js";
+import { MockFuturesClient, createTestDb, createTestConfig } from "./mocks.js";
+import { DEFAULT_FUTURES_CONFIG } from "../futures/types.js";
 
 describe("canRunInference", () => {
   it("allows inference for 'high' tier", () => {
@@ -117,6 +120,96 @@ describe("applyTierRestrictions", () => {
     const { inference, db } = makeMocks();
     applyTierRestrictions("dead", inference as any, db as any);
     expect(inference.setLowComputeMode).toHaveBeenCalledWith(true);
+  });
+});
+
+// ─── Futures Tier Restrictions ───────────────────────────────────
+
+describe("applyFuturesTierRestrictions", () => {
+  it("closes all positions on critical tier", async () => {
+    const futures = new MockFuturesClient();
+    const closeAllSpy = vi.spyOn(futures, "closeAllPositions");
+    const db = createTestDb();
+    const config = createTestConfig({
+      futuresConfig: {
+        ...DEFAULT_FUTURES_CONFIG,
+        gatewayUrl: "http://127.0.0.1:8400",
+        initialCapital: 1_000_000,
+      } as any,
+    });
+
+    await applyFuturesTierRestrictions("critical", futures, config, db);
+
+    expect(closeAllSpy).toHaveBeenCalled();
+    const action = db.getKV("tier_action_critical");
+    expect(action).toBeDefined();
+    const parsed = JSON.parse(action!);
+    expect(parsed.action).toBe("close_all_positions");
+    db.close();
+  });
+
+  it("restricts to first allowed instrument on low_compute tier", async () => {
+    const futures = new MockFuturesClient();
+    const db = createTestDb();
+    const config = createTestConfig({
+      futuresConfig: {
+        ...DEFAULT_FUTURES_CONFIG,
+        gatewayUrl: "http://127.0.0.1:8400",
+        initialCapital: 1_000_000,
+        tradingPolicy: {
+          ...DEFAULT_FUTURES_CONFIG.tradingPolicy!,
+          allowedInstruments: ["IF2403", "rb2405", "cu2406"],
+        },
+      } as any,
+    });
+
+    await applyFuturesTierRestrictions("low_compute", futures, config, db);
+
+    const restricted = db.getKV("restricted_instruments");
+    expect(restricted).toBe(JSON.stringify(["IF2403"]));
+    db.close();
+  });
+
+  it("clears restrictions on normal tier", async () => {
+    const futures = new MockFuturesClient();
+    const db = createTestDb();
+    db.setKV("restricted_instruments", JSON.stringify(["IF2403"]));
+    db.setKV("tier_action_critical", "{}");
+    const config = createTestConfig({
+      futuresConfig: {
+        ...DEFAULT_FUTURES_CONFIG,
+        gatewayUrl: "http://127.0.0.1:8400",
+        initialCapital: 1_000_000,
+      } as any,
+    });
+
+    await applyFuturesTierRestrictions("normal", futures, config, db);
+
+    expect(db.getKV("restricted_instruments")).toBeUndefined();
+    expect(db.getKV("tier_action_critical")).toBeUndefined();
+    db.close();
+  });
+
+  it("handles gateway failure gracefully on critical", async () => {
+    const futures = new MockFuturesClient();
+    futures.closeAllPositions = async () => {
+      throw new Error("gateway down");
+    };
+    const db = createTestDb();
+    const config = createTestConfig({
+      futuresConfig: {
+        ...DEFAULT_FUTURES_CONFIG,
+        gatewayUrl: "http://127.0.0.1:8400",
+        initialCapital: 1_000_000,
+      } as any,
+    });
+
+    // Should not throw
+    await applyFuturesTierRestrictions("critical", futures, config, db);
+
+    const action = JSON.parse(db.getKV("tier_action_critical")!);
+    expect(action.error).toBe("gateway_unavailable");
+    db.close();
   });
 });
 

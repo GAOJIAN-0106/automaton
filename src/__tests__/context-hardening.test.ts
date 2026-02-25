@@ -18,6 +18,8 @@ import {
 import { DEFAULT_TOKEN_BUDGET } from "../types.js";
 import type { AgentTurn, TokenBudget } from "../types.js";
 import { buildSystemPrompt } from "../agent/system-prompt.js";
+import type { FuturesFinancialState } from "../futures/types.js";
+import { DEFAULT_FUTURES_SURVIVAL_THRESHOLDS, DEFAULT_TRADING_POLICY } from "../futures/types.js";
 import {
   MockInferenceClient,
   createTestDb,
@@ -538,5 +540,321 @@ describe("DEFAULT_TOKEN_BUDGET", () => {
       DEFAULT_TOKEN_BUDGET.toolResults +
       DEFAULT_TOKEN_BUDGET.memoryRetrieval;
     expect(sum).toBe(DEFAULT_TOKEN_BUDGET.total);
+  });
+});
+
+// ─── Futures-mode system prompt ─────────────────────────────────
+
+function makeFuturesState(overrides?: Partial<FuturesFinancialState>): FuturesFinancialState {
+  return {
+    account: {
+      staticEquity: 1_000_000,
+      dynamicEquity: 900_000,
+      available: 700_000,
+      margin: 200_000,
+      floatingPnl: -100_000,
+      todayPnl: -50_000,
+      riskRatio: 0.222,
+      timestamp: new Date().toISOString(),
+    },
+    inferenceSpent: 150,
+    effectiveEquity: 899_850,
+    equityRatio: 0.89985,
+    initialCapital: 1_000_000,
+    lastChecked: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+function makeFuturesConfig() {
+  return createTestConfig({
+    futuresConfig: {
+      gatewayUrl: "http://127.0.0.1:8400",
+      initialCapital: 1_000_000,
+      survivalThresholds: DEFAULT_FUTURES_SURVIVAL_THRESHOLDS,
+      tradingPolicy: DEFAULT_TRADING_POLICY,
+    },
+  });
+}
+
+describe("buildSystemPrompt futures mode", () => {
+  let db: ReturnType<typeof createTestDb>;
+
+  beforeEach(() => {
+    db = createTestDb();
+  });
+
+  it("shows equity not credits in status block", () => {
+    const prompt = buildSystemPrompt({
+      identity: createTestIdentity(),
+      config: makeFuturesConfig(),
+      financial: { creditsCents: 0, usdcBalance: 0, lastChecked: new Date().toISOString() },
+      futuresState: makeFuturesState(),
+      state: "running",
+      db,
+      tools: [],
+      isFirstRun: false,
+    });
+
+    const statusStart = prompt.indexOf("--- CURRENT STATUS ---");
+    const statusEnd = prompt.indexOf("--- END STATUS ---");
+    const statusBlock = prompt.slice(statusStart, statusEnd);
+
+    expect(statusBlock).toContain("Equity:");
+    expect(statusBlock).toContain("Effective:");
+    expect(statusBlock).not.toContain("Credits:");
+  });
+
+  it("uses futures core rules instead of legacy", () => {
+    const prompt = buildSystemPrompt({
+      identity: createTestIdentity(),
+      config: makeFuturesConfig(),
+      financial: { creditsCents: 0, usdcBalance: 0, lastChecked: new Date().toISOString() },
+      futuresState: makeFuturesState(),
+      state: "running",
+      db,
+      tools: [],
+      isFirstRun: false,
+    });
+
+    // Futures rules present
+    expect(prompt).toContain("futures trading account");
+    expect(prompt).toContain("Maintain equity or die");
+
+    // Legacy rules absent
+    expect(prompt).not.toContain("stablecoin wallet");
+    expect(prompt).not.toContain("Pay for compute or die");
+  });
+
+  it("uses futures identity instead of legacy", () => {
+    const prompt = buildSystemPrompt({
+      identity: createTestIdentity(),
+      config: makeFuturesConfig(),
+      financial: { creditsCents: 0, usdcBalance: 0, lastChecked: new Date().toISOString() },
+      futuresState: makeFuturesState(),
+      state: "running",
+      db,
+      tools: [],
+      isFirstRun: false,
+    });
+
+    expect(prompt).toContain("pay for your own compute from trading equity");
+    expect(prompt).not.toContain("pay for your own compute.");
+  });
+
+  it("uses futures agentic sociology", () => {
+    const prompt = buildSystemPrompt({
+      identity: createTestIdentity(),
+      config: makeFuturesConfig(),
+      financial: { creditsCents: 0, usdcBalance: 0, lastChecked: new Date().toISOString() },
+      futuresState: makeFuturesState(),
+      state: "running",
+      db,
+      tools: [],
+      isFirstRun: false,
+    });
+
+    expect(prompt).toContain("Equity requires profitable trading");
+    expect(prompt).not.toContain("Money requires value creation");
+  });
+
+  it("uses futures operational context", () => {
+    const prompt = buildSystemPrompt({
+      identity: createTestIdentity(),
+      config: makeFuturesConfig(),
+      financial: { creditsCents: 0, usdcBalance: 0, lastChecked: new Date().toISOString() },
+      futuresState: makeFuturesState(),
+      state: "running",
+      db,
+      tools: [],
+      isFirstRun: false,
+    });
+
+    expect(prompt).toContain("Place and cancel orders on CTP futures exchange");
+    expect(prompt).toContain("Trading sessions");
+    expect(prompt).not.toContain("Make USDC payments via x402 protocol");
+    expect(prompt).not.toContain("Register and manage domain names");
+  });
+
+  it("status block has risk ratio", () => {
+    const prompt = buildSystemPrompt({
+      identity: createTestIdentity(),
+      config: makeFuturesConfig(),
+      financial: { creditsCents: 0, usdcBalance: 0, lastChecked: new Date().toISOString() },
+      futuresState: makeFuturesState(),
+      state: "running",
+      db,
+      tools: [],
+      isFirstRun: false,
+    });
+
+    const statusStart = prompt.indexOf("--- CURRENT STATUS ---");
+    const statusEnd = prompt.indexOf("--- END STATUS ---");
+    const statusBlock = prompt.slice(statusStart, statusEnd);
+
+    expect(statusBlock).toContain("Risk ratio: 22.2%");
+  });
+
+  it("status block includes trading policy summary", () => {
+    const prompt = buildSystemPrompt({
+      identity: createTestIdentity(),
+      config: makeFuturesConfig(),
+      financial: { creditsCents: 0, usdcBalance: 0, lastChecked: new Date().toISOString() },
+      futuresState: makeFuturesState(),
+      state: "running",
+      db,
+      tools: [],
+      isFirstRun: false,
+    });
+
+    const statusStart = prompt.indexOf("--- CURRENT STATUS ---");
+    const statusEnd = prompt.indexOf("--- END STATUS ---");
+    const statusBlock = prompt.slice(statusStart, statusEnd);
+
+    expect(statusBlock).toContain("Trading policy:");
+    expect(statusBlock).toContain("max position 10 lots");
+    expect(statusBlock).toContain("max leverage 5x");
+  });
+
+  it("status block includes inference spent", () => {
+    const prompt = buildSystemPrompt({
+      identity: createTestIdentity(),
+      config: makeFuturesConfig(),
+      financial: { creditsCents: 0, usdcBalance: 0, lastChecked: new Date().toISOString() },
+      futuresState: makeFuturesState({ inferenceSpent: 350.5 }),
+      state: "running",
+      db,
+      tools: [],
+      isFirstRun: false,
+    });
+
+    const statusStart = prompt.indexOf("--- CURRENT STATUS ---");
+    const statusEnd = prompt.indexOf("--- END STATUS ---");
+    const statusBlock = prompt.slice(statusStart, statusEnd);
+
+    expect(statusBlock).toContain("Inference spent:");
+    expect(statusBlock).toContain("350.50");
+  });
+
+  it("computes correct survival tier from equity ratio", () => {
+    const identity = createTestIdentity();
+    const config = makeFuturesConfig();
+    const financial = { creditsCents: 0, usdcBalance: 0, lastChecked: new Date().toISOString() };
+
+    // Normal tier (0.8 < ratio <= 1.2)
+    let prompt = buildSystemPrompt({
+      identity, config, financial,
+      futuresState: makeFuturesState({ equityRatio: 0.9 }),
+      state: "running", db, tools: [], isFirstRun: false,
+    });
+    expect(prompt).toContain("Survival tier: normal");
+
+    // High tier (ratio > 1.2)
+    prompt = buildSystemPrompt({
+      identity, config, financial,
+      futuresState: makeFuturesState({ equityRatio: 1.5 }),
+      state: "running", db, tools: [], isFirstRun: false,
+    });
+    expect(prompt).toContain("Survival tier: high");
+
+    // Low compute tier (0.5 < ratio <= 0.8)
+    prompt = buildSystemPrompt({
+      identity, config, financial,
+      futuresState: makeFuturesState({ equityRatio: 0.6 }),
+      state: "running", db, tools: [], isFirstRun: false,
+    });
+    expect(prompt).toContain("Survival tier: low_compute");
+
+    // Critical tier (0.2 < ratio <= 0.5)
+    prompt = buildSystemPrompt({
+      identity, config, financial,
+      futuresState: makeFuturesState({ equityRatio: 0.3 }),
+      state: "running", db, tools: [], isFirstRun: false,
+    });
+    expect(prompt).toContain("Survival tier: critical");
+
+    // Dead tier (ratio <= 0.2)
+    prompt = buildSystemPrompt({
+      identity, config, financial,
+      futuresState: makeFuturesState({ equityRatio: 0.1 }),
+      state: "running", db, tools: [], isFirstRun: false,
+    });
+    expect(prompt).toContain("Survival tier: dead");
+  });
+
+  it("shows allowed instruments when specified", () => {
+    const config = createTestConfig({
+      futuresConfig: {
+        gatewayUrl: "http://127.0.0.1:8400",
+        initialCapital: 1_000_000,
+        survivalThresholds: DEFAULT_FUTURES_SURVIVAL_THRESHOLDS,
+        tradingPolicy: {
+          ...DEFAULT_TRADING_POLICY,
+          allowedInstruments: ["IF2403", "rb2405"],
+        },
+      },
+    });
+
+    const prompt = buildSystemPrompt({
+      identity: createTestIdentity(),
+      config,
+      financial: { creditsCents: 0, usdcBalance: 0, lastChecked: new Date().toISOString() },
+      futuresState: makeFuturesState(),
+      state: "running",
+      db,
+      tools: [],
+      isFirstRun: false,
+    });
+
+    expect(prompt).toContain("instruments: IF2403, rb2405");
+  });
+});
+
+describe("buildSystemPrompt legacy mode unchanged (regression)", () => {
+  let db: ReturnType<typeof createTestDb>;
+
+  beforeEach(() => {
+    db = createTestDb();
+  });
+
+  it("uses legacy rules when no futuresState provided", () => {
+    const prompt = buildSystemPrompt({
+      identity: createTestIdentity(),
+      config: createTestConfig(),
+      financial: { creditsCents: 5000, usdcBalance: 10, lastChecked: new Date().toISOString() },
+      state: "running",
+      db,
+      tools: [],
+      isFirstRun: false,
+    });
+
+    // Legacy text present
+    expect(prompt).toContain("stablecoin wallet");
+    expect(prompt).toContain("Pay for compute or die");
+    expect(prompt).toContain("Credits: $50.00");
+    expect(prompt).toContain("Make USDC payments via x402 protocol");
+    expect(prompt).toContain("Register and manage domain names");
+
+    // Futures text absent
+    expect(prompt).not.toContain("futures trading account");
+    expect(prompt).not.toContain("Risk ratio:");
+    expect(prompt).not.toContain("Trading policy:");
+  });
+
+  it("does not leak futures concepts when futuresState is undefined", () => {
+    const prompt = buildSystemPrompt({
+      identity: createTestIdentity(),
+      config: createTestConfig(),
+      financial: { creditsCents: 100, usdcBalance: 5, lastChecked: new Date().toISOString() },
+      futuresState: undefined,
+      state: "running",
+      db,
+      tools: [],
+      isFirstRun: false,
+    });
+
+    expect(prompt).not.toContain("Equity:");
+    expect(prompt).not.toContain("CTP");
+    expect(prompt).not.toContain("Trading sessions");
   });
 });

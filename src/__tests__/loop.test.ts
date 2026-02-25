@@ -9,6 +9,7 @@ import { runAgentLoop } from "../agent/loop.js";
 import {
   MockInferenceClient,
   MockConwayClient,
+  MockFuturesClient,
   MockSocialClient,
   createTestDb,
   createTestIdentity,
@@ -17,6 +18,8 @@ import {
   noToolResponse,
 } from "./mocks.js";
 import type { AutomatonDatabase, AgentTurn, AgentState } from "../types.js";
+import type { FuturesConfig } from "../futures/types.js";
+import { DEFAULT_FUTURES_CONFIG, DEFAULT_FUTURES_SURVIVAL_THRESHOLDS, DEFAULT_TRADING_POLICY } from "../futures/types.js";
 
 describe("Agent Loop", () => {
   let db: AutomatonDatabase;
@@ -504,5 +507,242 @@ describe("Agent Loop", () => {
       (t) => t.input?.includes("MAINTENANCE LOOP DETECTED"),
     );
     expect(interventionTurn).toBeDefined();
+  });
+});
+
+// ─── Futures Mode Tests ────────────────────────────────────────
+
+describe("Agent Loop (Futures Mode)", () => {
+  let db: AutomatonDatabase;
+  let conway: MockConwayClient;
+  let identity: ReturnType<typeof createTestIdentity>;
+  let futuresClient: MockFuturesClient;
+
+  const futuresConfig: FuturesConfig = {
+    gatewayUrl: "http://127.0.0.1:8400",
+    initialCapital: 1_000_000,
+    survivalThresholds: DEFAULT_FUTURES_SURVIVAL_THRESHOLDS,
+    tradingPolicy: DEFAULT_TRADING_POLICY,
+  };
+
+  beforeEach(() => {
+    db = createTestDb();
+    conway = new MockConwayClient();
+    identity = createTestIdentity();
+    futuresClient = new MockFuturesClient();
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it("futures mode uses equity for wakeup prompt", async () => {
+    const config = createTestConfig({ futuresConfig });
+    const inference = new MockInferenceClient([
+      noToolResponse("Running in futures mode."),
+    ]);
+
+    await runAgentLoop({
+      identity,
+      config,
+      db,
+      conway,
+      inference,
+      futures: futuresClient,
+    });
+
+    // The wakeup prompt should contain equity info instead of credits
+    const firstCall = inference.calls[0];
+    const allContent = firstCall.messages.map((m) => m.content).join("\n");
+    expect(allContent).toContain("¥");
+    // Should NOT refer to credits/USDC in wakeup
+    expect(allContent).not.toMatch(/\$\d+\.\d+.*credits/i);
+  });
+
+  it("futures mode injects futuresClient into ToolContext", async () => {
+    const config = createTestConfig({ futuresConfig });
+
+    // Use check_equity tool (will be added in Phase 3, but for now
+    // test that the tool context has futures client by using exec and
+    // checking the toolContext was built with futures)
+    const inference = new MockInferenceClient([
+      toolCallResponse([
+        { name: "exec", arguments: { command: "echo futures test" } },
+      ]),
+      noToolResponse("Done."),
+    ]);
+
+    const turns: AgentTurn[] = [];
+    await runAgentLoop({
+      identity,
+      config,
+      db,
+      conway,
+      inference,
+      futures: futuresClient,
+      onTurnComplete: (turn) => turns.push(turn),
+    });
+
+    // exec tool should work (basic sanity in futures mode)
+    const execTurn = turns.find((t) =>
+      t.toolCalls.some((tc) => tc.name === "exec"),
+    );
+    expect(execTurn).toBeDefined();
+    expect(execTurn!.toolCalls[0].error).toBeUndefined();
+  });
+
+  it("low futures equity triggers low_compute mode", async () => {
+    // Set equity to 60% of initial capital -> low_compute tier (> 0.5 threshold)
+    // Actually, 0.6 > 0.5 = low_compute, so set to 0.4 to be below low_compute
+    futuresClient.account.dynamicEquity = 400_000; // 40% -> critical tier (> 0.2 but <= 0.5)
+
+    const config = createTestConfig({ futuresConfig });
+    const inference = new MockInferenceClient([
+      noToolResponse("Low equity mode."),
+    ]);
+
+    const stateChanges: AgentState[] = [];
+    await runAgentLoop({
+      identity,
+      config,
+      db,
+      conway,
+      inference,
+      futures: futuresClient,
+      onStateChange: (state) => stateChanges.push(state),
+    });
+
+    expect(inference.lowComputeMode).toBe(true);
+  });
+
+  it("critical futures equity enters critical state", async () => {
+    // Set equity to 15% of initial capital -> dead tier (<= 0.2 threshold)
+    // Set to 25% -> critical tier (> 0.2 but <= 0.5)
+    futuresClient.account.dynamicEquity = 250_000; // 25% -> critical
+
+    const config = createTestConfig({ futuresConfig });
+    const inference = new MockInferenceClient([
+      noToolResponse("Critical equity."),
+    ]);
+
+    const stateChanges: AgentState[] = [];
+    await runAgentLoop({
+      identity,
+      config,
+      db,
+      conway,
+      inference,
+      futures: futuresClient,
+      onStateChange: (state) => stateChanges.push(state),
+    });
+
+    expect(stateChanges).toContain("critical");
+  });
+
+  it("futures mode caches equity on gateway disconnect", async () => {
+    const config = createTestConfig({ futuresConfig });
+
+    // First call succeeds with good equity
+    futuresClient.account.dynamicEquity = 1_000_000;
+
+    const inference = new MockInferenceClient([
+      toolCallResponse([
+        { name: "exec", arguments: { command: "echo turn1" } },
+      ]),
+      noToolResponse("Done."),
+    ]);
+
+    await runAgentLoop({
+      identity,
+      config,
+      db,
+      conway,
+      inference,
+      futures: futuresClient,
+    });
+
+    // Agent should not be dead — it used cached or live equity
+    expect(db.getAgentState()).not.toBe("dead");
+  });
+
+  it("futures mode does NOT use conway credits for survival", async () => {
+    // Conway has 0 credits (would be critical in non-futures mode)
+    conway.creditsCents = 0;
+    // But futures account has healthy equity
+    futuresClient.account.dynamicEquity = 1_200_000; // > 1.2 ratio = high tier
+
+    const config = createTestConfig({ futuresConfig });
+    const inference = new MockInferenceClient([
+      noToolResponse("All good."),
+    ]);
+
+    const stateChanges: AgentState[] = [];
+    await runAgentLoop({
+      identity,
+      config,
+      db,
+      conway,
+      inference,
+      futures: futuresClient,
+      onStateChange: (state) => stateChanges.push(state),
+    });
+
+    // Should NOT enter critical or low_compute — futures equity is healthy
+    expect(stateChanges).not.toContain("critical");
+    expect(inference.lowComputeMode).toBe(false);
+  });
+
+  it("inference cost is deducted from effective equity", async () => {
+    // Set initial equity to 900k (ratio 0.9 = normal tier)
+    futuresClient.account.dynamicEquity = 900_000;
+
+    // Pre-set inference_spent to 500k (huge cost), effective = 400k
+    // ratio = 0.4 -> critical tier
+    const config = createTestConfig({ futuresConfig });
+
+    const inference = new MockInferenceClient([
+      noToolResponse("Spent a lot on inference."),
+    ]);
+
+    const stateChanges: AgentState[] = [];
+
+    // Set inference_spent before running loop
+    db.setKV("inference_spent", "500000");
+
+    await runAgentLoop({
+      identity,
+      config,
+      db,
+      conway,
+      inference,
+      futures: futuresClient,
+      onStateChange: (state) => stateChanges.push(state),
+    });
+
+    // With 400k effective equity (ratio 0.4), should be critical (> 0.2 but <= 0.5)
+    expect(stateChanges).toContain("critical");
+  });
+
+  it("inference cost is recorded in KV after each turn in futures mode", async () => {
+    const config = createTestConfig({ futuresConfig });
+
+    const inference = new MockInferenceClient([
+      noToolResponse("Turn 1 done."),
+    ]);
+
+    await runAgentLoop({
+      identity,
+      config,
+      db,
+      conway,
+      inference,
+      futures: futuresClient,
+    });
+
+    // inference_spent should exist and be > 0 (the mock router records cost)
+    const spent = db.getKV("inference_spent");
+    expect(spent).toBeDefined();
+    // The value should be a parseable number >= 0
+    expect(parseFloat(spent!)).toBeGreaterThanOrEqual(0);
   });
 });

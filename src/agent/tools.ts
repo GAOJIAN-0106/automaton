@@ -213,85 +213,6 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
 
     // ── Conway API Tools ──
     {
-      name: "check_credits",
-      description: "Check your current Conway compute credit balance.",
-      category: "conway",
-      riskLevel: "safe",
-      parameters: { type: "object", properties: {} },
-      execute: async (_args, ctx) => {
-        const balance = await ctx.conway.getCreditsBalance();
-        return `Credit balance: $${(balance / 100).toFixed(2)} (${balance} cents)`;
-      },
-    },
-    {
-      name: "check_usdc_balance",
-      description: "Check your on-chain USDC balance on Base.",
-      category: "conway",
-      riskLevel: "safe",
-      parameters: { type: "object", properties: {} },
-      execute: async (_args, ctx) => {
-        const { getUsdcBalance } = await import("../conway/x402.js");
-        const balance = await getUsdcBalance(ctx.identity.address);
-        return `USDC balance: ${balance.toFixed(6)} USDC on Base`;
-      },
-    },
-    {
-      name: "topup_credits",
-      description:
-        "Buy Conway compute credits by paying USDC from your wallet via x402. Valid tier amounts: $5, $25, $100, $500, $1000, $2500. Check your USDC balance first with check_usdc_balance.",
-      category: "financial",
-      riskLevel: "caution",
-      parameters: {
-        type: "object",
-        properties: {
-          amount_usd: {
-            type: "number",
-            description:
-              "Amount in USD to spend on credits. Must be one of the valid tiers: 5, 25, 100, 500, 1000, 2500.",
-          },
-        },
-        required: ["amount_usd"],
-      },
-      execute: async (args, ctx) => {
-        const { topupCredits, TOPUP_TIERS } = await import("../conway/topup.js");
-        const amountUsd = args.amount_usd as number;
-
-        if (!TOPUP_TIERS.includes(amountUsd)) {
-          return `Invalid tier. Valid amounts (USD): ${TOPUP_TIERS.join(", ")}`;
-        }
-
-        // Check USDC balance first
-        const { getUsdcBalance } = await import("../conway/x402.js");
-        const usdcBalance = await getUsdcBalance(ctx.identity.address);
-        if (usdcBalance < amountUsd) {
-          return `Insufficient USDC. Balance: $${usdcBalance.toFixed(2)}, requested: $${amountUsd}. Choose a smaller tier or wait for funding.`;
-        }
-
-        const result = await topupCredits(
-          ctx.config.conwayApiUrl,
-          ctx.identity.account,
-          amountUsd,
-        );
-
-        if (!result.success) {
-          return `Credit topup failed: ${result.error}`;
-        }
-
-        // Record transaction
-        const { ulid } = await import("ulid");
-        ctx.db.insertTransaction({
-          id: ulid(),
-          type: "credit_purchase",
-          amountCents: amountUsd * 100,
-          balanceAfterCents: result.creditsCentsAdded,
-          description: `x402 credit topup: $${amountUsd} USD`,
-          timestamp: new Date().toISOString(),
-        });
-
-        return `Credit topup successful: +$${amountUsd} (${amountUsd * 100} cents) credits purchased via x402. Check your new balance with check_credits.`;
-      },
-    },
-    {
       name: "create_sandbox",
       description:
         "Create a new Conway sandbox (separate VM) for sub-tasks or testing.",
@@ -838,54 +759,6 @@ Model: ${ctx.inference.getDefaultModel()}
       },
     },
 
-    // ── Financial: Transfer Credits ──
-    {
-      name: "transfer_credits",
-      description: "Transfer Conway compute credits to another address.",
-      category: "financial",
-      riskLevel: "dangerous",
-      parameters: {
-        type: "object",
-        properties: {
-          to_address: { type: "string", description: "Recipient address" },
-          amount_cents: { type: "number", description: "Amount in cents" },
-          reason: { type: "string", description: "Reason for transfer" },
-        },
-        required: ["to_address", "amount_cents"],
-      },
-      execute: async (args, ctx) => {
-        const amount = args.amount_cents as number;
-        if (!Number.isFinite(amount) || amount <= 0) {
-          return `Blocked: amount_cents must be a positive number, got ${amount}.`;
-        }
-
-        // Guard: don't transfer more than half your balance
-        const balance = await ctx.conway.getCreditsBalance();
-        if (amount > balance / 2) {
-          return `Blocked: Cannot transfer more than half your balance ($${(balance / 100).toFixed(2)}). Self-preservation.`;
-        }
-
-        const transfer = await ctx.conway.transferCredits(
-          args.to_address as string,
-          amount,
-          args.reason as string | undefined,
-        );
-
-        const { ulid } = await import("ulid");
-        ctx.db.insertTransaction({
-          id: ulid(),
-          type: "transfer_out",
-          amountCents: amount,
-          balanceAfterCents:
-            transfer.balanceAfterCents ?? Math.max(balance - amount, 0),
-          description: `Transfer to ${args.to_address}: ${args.reason || ""}`,
-          timestamp: new Date().toISOString(),
-        });
-
-        return `Credit transfer submitted: $${(amount / 100).toFixed(2)} to ${transfer.toAddress} (status: ${transfer.status}, id: ${transfer.transferId || "n/a"})`;
-      },
-    },
-
     // ── Skills Tools ──
     {
       name: "install_skill",
@@ -1357,26 +1230,24 @@ Model: ${ctx.inference.getDefaultModel()}
     },
     {
       name: "fund_child",
-      description: "Transfer credits to a child automaton. Requires wallet_verified status.",
+      description: "Allocate virtual capital from your futures equity to a child automaton.",
       category: "replication",
       riskLevel: "dangerous",
       parameters: {
         type: "object",
         properties: {
           child_id: { type: "string", description: "Child automaton ID" },
-          amount_cents: { type: "number", description: "Amount in cents to transfer" },
+          amount_cny: { type: "number", description: "Amount in CNY to allocate from your equity" },
         },
-        required: ["child_id", "amount_cents"],
+        required: ["child_id", "amount_cny"],
       },
       execute: async (args, ctx) => {
+        if (!ctx.futures) {
+          return "Blocked: Futures mode not enabled. fund_child requires futures configuration.";
+        }
+
         const child = ctx.db.getChildById(args.child_id as string);
         if (!child) return `Child ${args.child_id} not found.`;
-
-        // Reject zero-address
-        const { isValidWalletAddress } = await import("../replication/spawn.js");
-        if (!isValidWalletAddress(child.address)) {
-          return `Blocked: Child ${args.child_id} has invalid wallet address. Must be wallet_verified.`;
-        }
 
         // Require wallet_verified or later status
         const validFundingStates = ["wallet_verified", "funded", "starting", "healthy", "unhealthy"];
@@ -1384,50 +1255,41 @@ Model: ${ctx.inference.getDefaultModel()}
           return `Blocked: Child status is '${child.status}', must be wallet_verified or later to fund.`;
         }
 
-        const amount = args.amount_cents as number;
+        const amount = args.amount_cny as number;
         if (!Number.isFinite(amount) || amount <= 0) {
-          return `Blocked: amount_cents must be a positive number, got ${amount}.`;
+          return `Blocked: amount_cny must be a positive number, got ${amount}.`;
         }
 
-        const balance = await ctx.conway.getCreditsBalance();
-        if (amount > balance / 2) {
-          return `Blocked: Cannot transfer more than half your balance. Self-preservation.`;
+        // Check equity can support the allocation
+        const account = await ctx.futures.getAccount();
+        if (amount > account.available / 2) {
+          const { formatEquity } = await import("../futures/index.js");
+          return `Blocked: Cannot allocate more than half your available equity (${formatEquity(account.available)}). Self-preservation.`;
         }
 
-        const transfer = await ctx.conway.transferCredits(
-          child.address,
-          amount,
-          `fund child ${child.id}`,
-        );
+        // Record the virtual capital allocation in KV
+        const allocKey = `child_capital_${child.id}`;
+        const existing = parseFloat(ctx.db.getKV(allocKey) || "0");
+        ctx.db.setKV(allocKey, String(existing + amount));
 
-        const { ulid } = await import("ulid");
-        ctx.db.insertTransaction({
-          id: ulid(),
-          type: "transfer_out",
-          amountCents: amount,
-          balanceAfterCents:
-            transfer.balanceAfterCents ?? Math.max(balance - amount, 0),
-          description: `Fund child ${child.name} (${child.id})`,
-          timestamp: new Date().toISOString(),
-        });
-
-        // Update funded amount
+        // Update funded amount (store in cents for backward compatibility)
         ctx.db.raw.prepare(
           "UPDATE children SET funded_amount_cents = funded_amount_cents + ? WHERE id = ?",
-        ).run(amount, child.id);
+        ).run(Math.round(amount * 100), child.id);
 
         // Transition to funded if wallet_verified
         if (child.status === "wallet_verified") {
           try {
             const { ChildLifecycle } = await import("../replication/lifecycle.js");
             const lifecycle = new ChildLifecycle(ctx.db.raw);
-            lifecycle.transition(child.id, "funded", `funded with ${amount} cents`);
+            lifecycle.transition(child.id, "funded", `allocated ${amount} CNY virtual capital`);
           } catch {
             // Non-critical: may already be in funded state
           }
         }
 
-        return `Funded child ${child.name} with $${(amount / 100).toFixed(2)} (status: ${transfer.status}, id: ${transfer.transferId || "n/a"})`;
+        const { formatEquity } = await import("../futures/index.js");
+        return `Allocated ${formatEquity(amount)} virtual capital to child ${child.name} (total: ${formatEquity(existing + amount)})`;
       },
     },
     {
@@ -2278,70 +2140,264 @@ Model: ${ctx.inference.getDefaultModel()}
       },
     },
 
-    // ── x402 Payment Tool ──
+    // === Futures Trading Tools ===
+
+    // ── Query Tools (safe) ──
     {
-      name: "x402_fetch",
+      name: "check_equity",
       description:
-        "Fetch a URL with automatic x402 USDC payment. If the server responds with HTTP 402, signs a USDC payment and retries. Use this to access paid APIs and services.",
-      category: "financial",
+        "Check your futures account equity, margin state, and survival tier.",
+      category: "trading",
+      riskLevel: "safe",
+      parameters: { type: "object", properties: {} },
+      execute: async (_args, ctx) => {
+        if (!ctx.futures) return "Futures mode not enabled.";
+        const account = await ctx.futures.getAccount();
+        const { computeFinancialState, getFuturesSurvivalTier, formatEquity } =
+          await import("../futures/index.js");
+        const inferenceSpent = parseFloat(
+          ctx.db.getKV("inference_spent_cny") || "0",
+        );
+        const initialCapital =
+          ctx.config.futuresConfig?.initialCapital || 1_000_000;
+        const state = computeFinancialState(
+          account,
+          inferenceSpent,
+          initialCapital,
+        );
+        const { DEFAULT_FUTURES_SURVIVAL_THRESHOLDS } = await import(
+          "../futures/types.js"
+        );
+        const thresholds =
+          ctx.config.futuresConfig?.survivalThresholds ||
+          DEFAULT_FUTURES_SURVIVAL_THRESHOLDS;
+        const tier = getFuturesSurvivalTier(state.equityRatio, thresholds);
+
+        return `=== Futures Account ===
+Dynamic Equity: ${formatEquity(account.dynamicEquity)}
+Effective Equity: ${formatEquity(state.effectiveEquity)}
+Available: ${formatEquity(account.available)}
+Margin Used: ${formatEquity(account.margin)}
+Floating P&L: ${formatEquity(account.floatingPnl)}
+Today P&L: ${formatEquity(account.todayPnl)}
+Risk Ratio: ${(account.riskRatio * 100).toFixed(1)}%
+Inference Spent: ${formatEquity(inferenceSpent)}
+Equity Ratio: ${(state.equityRatio * 100).toFixed(1)}%
+Survival Tier: ${tier}
+========================`;
+      },
+    },
+    {
+      name: "check_positions",
+      description: "List all open futures positions with P&L.",
+      category: "trading",
+      riskLevel: "safe",
+      parameters: { type: "object", properties: {} },
+      execute: async (_args, ctx) => {
+        if (!ctx.futures) return "Futures mode not enabled.";
+        const positions = await ctx.futures.getPositions();
+        if (positions.length === 0) return "No open positions.";
+        const { formatEquity } = await import("../futures/index.js");
+        return positions
+          .map(
+            (p) =>
+              `${p.instrumentId} ${p.direction.toUpperCase()} x${p.volume} @ ${p.openPrice} -> ${p.currentPrice} | P&L: ${formatEquity(p.floatingPnl)} | Margin: ${formatEquity(p.margin)}`,
+          )
+          .join("\n");
+      },
+    },
+    {
+      name: "get_market_snapshot",
+      description:
+        "Get real-time market snapshot for a futures instrument.",
+      category: "trading",
+      riskLevel: "safe",
+      parameters: {
+        type: "object",
+        properties: {
+          instrument_id: {
+            type: "string",
+            description:
+              "Instrument ID (e.g., 'IF2403', 'rb2405')",
+          },
+        },
+        required: ["instrument_id"],
+      },
+      execute: async (args, ctx) => {
+        if (!ctx.futures) return "Futures mode not enabled.";
+        const snap = await ctx.futures.getMarketSnapshot(
+          args.instrument_id as string,
+        );
+        return `=== ${snap.instrumentId} ===
+Last: ${snap.lastPrice} | Bid: ${snap.bidPrice}x${snap.bidVolume} | Ask: ${snap.askPrice}x${snap.askVolume}
+Open: ${snap.openPrice} | High: ${snap.highPrice} | Low: ${snap.lowPrice} | PreClose: ${snap.preClosePrice}
+Limit: [${snap.lowerLimit}, ${snap.upperLimit}]
+Volume: ${snap.volume} | Turnover: ${snap.turnover} | OI: ${snap.openInterest}`;
+      },
+    },
+    {
+      name: "get_pnl_report",
+      description:
+        "Get today's P&L summary including realized and unrealized profits.",
+      category: "trading",
+      riskLevel: "safe",
+      parameters: { type: "object", properties: {} },
+      execute: async (_args, ctx) => {
+        if (!ctx.futures) return "Futures mode not enabled.";
+        const pnl = await ctx.futures.getPnl();
+        const { formatEquity } = await import("../futures/index.js");
+        return `=== P&L Report ===
+Today Realized: ${formatEquity(pnl.todayPnl)}
+Floating (Unrealized): ${formatEquity(pnl.floatingPnl)}
+Total: ${formatEquity(pnl.totalPnl)}
+====================`;
+      },
+    },
+
+    // ── Trading Tools (dangerous, requires PolicyEngine approval) ──
+    {
+      name: "place_order",
+      description:
+        "Place a futures order (buy/sell, market/limit, open/close). Subject to trading policy risk controls.",
+      category: "trading",
       riskLevel: "dangerous",
       parameters: {
         type: "object",
         properties: {
-          url: {
+          instrument_id: {
             type: "string",
-            description: "The URL to fetch",
+            description: "Instrument ID (e.g., 'IF2403')",
           },
-          method: {
+          direction: {
             type: "string",
-            description: "HTTP method (default: GET)",
+            description: "Order direction: 'buy' or 'sell'",
           },
-          body: {
+          order_type: {
             type: "string",
-            description: "Request body for POST/PUT (JSON string)",
+            description: "Order type: 'market' or 'limit'",
           },
-          headers: {
+          offset: {
             type: "string",
-            description: "Additional headers as JSON string",
+            description:
+              "Open/close flag: 'open', 'close', or 'close_today'",
+          },
+          volume: {
+            type: "number",
+            description: "Number of contracts",
+          },
+          price: {
+            type: "number",
+            description: "Limit price (required for limit orders)",
           },
         },
-        required: ["url"],
+        required: [
+          "instrument_id",
+          "direction",
+          "order_type",
+          "offset",
+          "volume",
+        ],
       },
       execute: async (args, ctx) => {
-        const { x402Fetch } = await import("../conway/x402.js");
-        const { DEFAULT_TREASURY_POLICY } = await import("../types.js");
-        const url = args.url as string;
-        const method = (args.method as string) || "GET";
-        const body = args.body as string | undefined;
-        const extraHeaders = args.headers
-          ? JSON.parse(args.headers as string)
-          : undefined;
-
-        const maxPayment = ctx.config.treasuryPolicy?.maxX402PaymentCents
-          ?? DEFAULT_TREASURY_POLICY.maxX402PaymentCents;
-        const result = await x402Fetch(
-          url,
-          ctx.identity.account,
-          method,
-          body,
-          extraHeaders,
-          maxPayment,
-        );
+        if (!ctx.futures) return "Futures mode not enabled.";
+        const result = await ctx.futures.placeOrder({
+          instrumentId: args.instrument_id as string,
+          direction: args.direction as "buy" | "sell",
+          orderType: args.order_type as "market" | "limit",
+          offset: args.offset as "open" | "close" | "close_today",
+          volume: args.volume as number,
+          price: args.price as number | undefined,
+        });
 
         if (!result.success) {
-          return `x402 fetch failed: ${result.error || "Unknown error"}`;
+          return `Order rejected: ${result.error || "Unknown reason"}`;
         }
-
-        const responseStr =
-          typeof result.response === "string"
-            ? result.response
-            : JSON.stringify(result.response, null, 2);
-
-        // Truncate very large responses
-        if (responseStr.length > 10000) {
-          return `x402 fetch succeeded (truncated):\n${responseStr.slice(0, 10000)}...`;
+        return `Order ${result.status}: ${args.direction} ${args.offset} ${args.volume}x ${args.instrument_id} @ ${result.filledPrice || args.price || "market"} (id: ${result.orderId})`;
+      },
+    },
+    {
+      name: "cancel_order",
+      description: "Cancel a pending futures order by order ID.",
+      category: "trading",
+      riskLevel: "dangerous",
+      parameters: {
+        type: "object",
+        properties: {
+          order_id: {
+            type: "string",
+            description: "Order ID to cancel",
+          },
+        },
+        required: ["order_id"],
+      },
+      execute: async (args, ctx) => {
+        if (!ctx.futures) return "Futures mode not enabled.";
+        const result = await ctx.futures.cancelOrder(
+          args.order_id as string,
+        );
+        return result.success
+          ? `Order ${args.order_id} cancelled.`
+          : `Cancel failed: ${result.error || "Unknown error"}`;
+      },
+    },
+    {
+      name: "close_position",
+      description:
+        "Close an open position for a specific instrument and direction.",
+      category: "trading",
+      riskLevel: "dangerous",
+      parameters: {
+        type: "object",
+        properties: {
+          instrument_id: {
+            type: "string",
+            description: "Instrument ID",
+          },
+          direction: {
+            type: "string",
+            description: "Position direction: 'long' or 'short'",
+          },
+          volume: {
+            type: "number",
+            description:
+              "Number of contracts to close (default: all)",
+          },
+        },
+        required: ["instrument_id", "direction"],
+      },
+      execute: async (args, ctx) => {
+        if (!ctx.futures) return "Futures mode not enabled.";
+        const result = await ctx.futures.closePosition(
+          args.instrument_id as string,
+          args.direction as "long" | "short",
+          args.volume as number | undefined,
+        );
+        if (!result.success) {
+          return `Close failed: ${result.error || "Unknown error"}`;
         }
-        return `x402 fetch succeeded:\n${responseStr}`;
+        return `Position closed: ${args.instrument_id} ${args.direction} x${result.filledVolume} @ ${result.filledPrice} (id: ${result.orderId})`;
+      },
+    },
+    {
+      name: "close_all_positions",
+      description:
+        "Emergency: close ALL open positions immediately. Use with extreme caution.",
+      category: "trading",
+      riskLevel: "dangerous",
+      parameters: { type: "object", properties: {} },
+      execute: async (_args, ctx) => {
+        if (!ctx.futures) return "Futures mode not enabled.";
+        const results = await ctx.futures.closeAllPositions();
+        if (results.length === 0) return "No positions to close.";
+        const succeeded = results.filter((r) => r.success).length;
+        const summary = results
+          .map((r) =>
+            r.success
+              ? `OK closed (id: ${r.orderId})`
+              : `FAIL: ${r.error}`,
+          )
+          .join("\n");
+        return `Closed ${succeeded}/${results.length} positions:\n${summary}`;
       },
     },
   ];
@@ -2466,39 +2522,9 @@ export async function executeTool(
       result = sanitizeToolResult(result);
     }
 
-    // Record spend for financial operations
-    if (turnContext && !result.startsWith("Blocked:")) {
-      if (toolName === "transfer_credits") {
-        const amount = args.amount_cents as number | undefined;
-        if (amount && amount > 0) {
-          try {
-            turnContext.sessionSpend.recordSpend({
-              toolName: "transfer_credits",
-              amountCents: amount,
-              recipient: args.to_address as string | undefined,
-              category: "transfer",
-            });
-          } catch (error) {
-            logger.error("Spend tracking failed for transfer_credits", error instanceof Error ? error : undefined);
-          }
-        }
-      } else if (toolName === "x402_fetch") {
-        // x402 payment amounts are determined by the server response,
-        // but we record a nominal entry for tracking purposes
-        try {
-          turnContext.sessionSpend.recordSpend({
-            toolName: "x402_fetch",
-            amountCents: 0, // Actual amount is inside the x402 protocol
-            domain: (() => {
-              try { return new URL(args.url as string).hostname; } catch { return undefined; }
-            })(),
-            category: "x402",
-          });
-        } catch (error) {
-          logger.error("Spend tracking failed for x402_fetch", error instanceof Error ? error : undefined);
-        }
-      }
-    }
+    // Record spend for trading operations (futures mode)
+    // Note: trading commissions are tracked by the CTP exchange, not here.
+    // Inference cost tracking is handled separately in the agent loop.
 
     return {
       id: ulid(),

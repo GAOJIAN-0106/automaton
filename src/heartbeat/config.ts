@@ -55,6 +55,25 @@ const DEFAULT_HEARTBEAT_CONFIG: HeartbeatConfig = {
       task: "check_social_inbox",
       enabled: true,
     },
+    // Phase 6: Futures-mode tasks (no-op when not in futures mode)
+    {
+      name: "check_equity",
+      schedule: "*/5 * * * *",
+      task: "check_equity",
+      enabled: true,
+    },
+    {
+      name: "check_positions",
+      schedule: "*/1 * * * *",
+      task: "check_positions",
+      enabled: true,
+    },
+    {
+      name: "risk_monitor",
+      schedule: "*/1 * * * *",
+      task: "risk_monitor",
+      enabled: true,
+    },
   ],
   defaultIntervalMs: 60_000,
   lowComputeMultiplier: 4,

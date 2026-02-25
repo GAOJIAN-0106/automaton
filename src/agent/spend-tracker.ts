@@ -37,6 +37,30 @@ function getCurrentDayWindow(): string {
   return now.toISOString().slice(0, 10); // '2026-02-19'
 }
 
+/**
+ * Record inference cost in CNY to the cumulative `inference_spent` KV.
+ * Used in futures mode to deduct inference costs from effective equity.
+ * Negative costs are ignored (no-op).
+ */
+export function recordInferenceCostCny(
+  db: Database.Database,
+  costCny: number,
+): void {
+  if (costCny < 0) return;
+
+  const row = db
+    .prepare("SELECT value FROM kv WHERE key = 'inference_spent'")
+    .get() as { value: string } | undefined;
+
+  const current = row ? parseFloat(row.value) : 0;
+  const updated = current + costCny;
+
+  db.prepare(
+    `INSERT INTO kv (key, value, updated_at) VALUES ('inference_spent', ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = datetime('now')`,
+  ).run(String(updated), String(updated));
+}
+
 export class SpendTracker implements SpendTrackerInterface {
   private db: Database.Database;
 

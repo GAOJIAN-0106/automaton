@@ -22,8 +22,11 @@ import type {
   SpendTrackerInterface,
   InputSource,
   ModelStrategyConfig,
+  SurvivalTier,
 } from "../types.js";
 import { DEFAULT_MODEL_STRATEGY_CONFIG } from "../types.js";
+import type { FuturesGatewayClient, FuturesFinancialState } from "../futures/types.js";
+import { computeFinancialState, getFuturesSurvivalTier, formatEquity } from "../futures/account.js";
 import type { PolicyEngine } from "./policy-engine.js";
 import { buildSystemPrompt, buildWakeupPrompt } from "./system-prompt.js";
 import { buildContextMessages, trimContext } from "./context.js";
@@ -34,6 +37,7 @@ import {
   executeTool,
 } from "./tools.js";
 import { sanitizeInput } from "./injection-defense.js";
+import { recordInferenceCostCny } from "./spend-tracker.js";
 import { getSurvivalTier } from "../conway/credits.js";
 import { getUsdcBalance } from "../conway/x402.js";
 import {
@@ -66,6 +70,7 @@ export interface AgentLoopOptions {
   conway: ConwayClient;
   inference: InferenceClient;
   social?: SocialClientInterface;
+  futures?: FuturesGatewayClient;
   skills?: Skill[];
   policyEngine?: PolicyEngine;
   spendTracker?: SpendTrackerInterface;
@@ -81,8 +86,10 @@ export interface AgentLoopOptions {
 export async function runAgentLoop(
   options: AgentLoopOptions,
 ): Promise<void> {
-  const { identity, config, db, conway, inference, social, skills, policyEngine, spendTracker, onStateChange, onTurnComplete, ollamaBaseUrl } =
+  const { identity, config, db, conway, inference, social, futures, skills, policyEngine, spendTracker, onStateChange, onTurnComplete, ollamaBaseUrl } =
     options;
+
+  const isFuturesMode = !!config.futuresConfig && !!futures;
 
   const builtinTools = createBuiltinTools(identity.sandboxId);
   const installedTools = loadInstalledTools(db);
@@ -94,6 +101,7 @@ export async function runAgentLoop(
     conway,
     inference,
     social,
+    futures,
   };
 
   // Initialize inference router (Phase 2.3)
@@ -137,23 +145,37 @@ export async function runAgentLoop(
 
   // Get financial state
   let financial = await getFinancialState(conway, identity.address, db);
+  let futuresState: FuturesFinancialState | undefined;
+
+  if (isFuturesMode) {
+    futuresState = await getFuturesFinancialState(futures, config.futuresConfig!.initialCapital, db);
+  }
 
   // Check if this is the first run
   const isFirstRun = db.getTurnCount() === 0;
 
-  // Build wakeup prompt
-  const wakeupInput = buildWakeupPrompt({
-    identity,
-    config,
-    financial,
-    db,
-  });
+  // Build wakeup prompt (in futures mode, override financial with equity-based values)
+  const wakeupFinancial: FinancialState = isFuturesMode && futuresState
+    ? {
+        creditsCents: Math.round(futuresState.effectiveEquity * 100), // use as sentinel for prompt compatibility
+        usdcBalance: 0,
+        lastChecked: futuresState.lastChecked,
+      }
+    : financial;
+
+  const wakeupInput = isFuturesMode && futuresState
+    ? buildFuturesWakeupPrompt(identity, config, futuresState, db)
+    : buildWakeupPrompt({ identity, config, financial, db });
 
   // Transition to running
   db.setAgentState("running");
   onStateChange?.("running");
 
-  log(config, `[WAKE UP] ${config.name} is alive. Credits: $${(financial.creditsCents / 100).toFixed(2)}`);
+  if (isFuturesMode && futuresState) {
+    log(config, `[WAKE UP] ${config.name} is alive. Equity: ${formatEquity(futuresState.effectiveEquity)}`);
+  } else {
+    log(config, `[WAKE UP] ${config.name} is alive. Credits: $${(financial.creditsCents / 100).toFixed(2)}`);
+  }
 
   // ─── The Loop ──────────────────────────────────────────────
 
@@ -201,57 +223,22 @@ export async function runAgentLoop(
       }
 
       // Refresh financial state periodically
-      financial = await getFinancialState(conway, identity.address, db);
+      let currentTier: SurvivalTier;
 
-      // Check survival tier
-      // api_unreachable: creditsCents === -1 means API failed with no cache.
-      // Do NOT kill the agent; continue in low-compute mode and retry next tick.
-      if (financial.creditsCents === -1) {
-        log(config, "[API_UNREACHABLE] Balance API unreachable, continuing in low-compute mode.");
-        inference.setLowComputeMode(true);
-      } else {
-        const tier = getSurvivalTier(financial.creditsCents);
+      if (isFuturesMode) {
+        // ── Futures mode: equity-based survival ──
+        futuresState = await getFuturesFinancialState(futures!, config.futuresConfig!.initialCapital, db);
+        currentTier = getFuturesSurvivalTier(
+          futuresState.equityRatio,
+          config.futuresConfig!.survivalThresholds,
+        );
 
-        // Inline auto-topup: if credits are critically low and USDC is
-        // available, buy credits NOW — before attempting inference.
-        // This prevents the agent from dying mid-loop while waiting for
-        // the heartbeat to fire. Uses a 60s cooldown to avoid hammering.
-        if ((tier === "critical" || tier === "low_compute") && financial.usdcBalance >= 5) {
-          const INLINE_TOPUP_COOLDOWN_MS = 60_000;
-          const lastInlineTopup = db.getKV("last_inline_topup_attempt");
-          const cooldownExpired = !lastInlineTopup ||
-            Date.now() - new Date(lastInlineTopup).getTime() >= INLINE_TOPUP_COOLDOWN_MS;
-
-          if (cooldownExpired) {
-            db.setKV("last_inline_topup_attempt", new Date().toISOString());
-            try {
-              const { bootstrapTopup } = await import("../conway/topup.js");
-              const topupResult = await bootstrapTopup({
-                apiUrl: config.conwayApiUrl,
-                account: identity.account,
-                creditsCents: financial.creditsCents,
-              });
-              if (topupResult?.success) {
-                log(config, `[AUTO-TOPUP] Bought $${topupResult.amountUsd} credits from USDC mid-loop`);
-                // Re-fetch financial state after topup so the rest of
-                // the turn sees the updated balance.
-                financial = await getFinancialState(conway, identity.address, db);
-              }
-            } catch (err: any) {
-              logger.warn(`Inline auto-topup failed: ${err.message}`);
-            }
-          }
-        }
-
-        // Re-evaluate tier after potential topup
-        const effectiveTier = getSurvivalTier(financial.creditsCents);
-
-        if (effectiveTier === "critical") {
-          log(config, "[CRITICAL] Credits critically low. Limited operation.");
+        if (currentTier === "critical") {
+          log(config, `[CRITICAL] Equity critically low: ${formatEquity(futuresState.effectiveEquity)}. Limited operation.`);
           db.setAgentState("critical");
           onStateChange?.("critical");
           inference.setLowComputeMode(true);
-        } else if (effectiveTier === "low_compute") {
+        } else if (currentTier === "low_compute") {
           db.setAgentState("low_compute");
           onStateChange?.("low_compute");
           inference.setLowComputeMode(true);
@@ -261,6 +248,72 @@ export async function runAgentLoop(
             onStateChange?.("running");
           }
           inference.setLowComputeMode(false);
+        }
+      } else {
+        // ── Legacy mode: credits-based survival ──
+        financial = await getFinancialState(conway, identity.address, db);
+
+        // Check survival tier
+        // api_unreachable: creditsCents === -1 means API failed with no cache.
+        // Do NOT kill the agent; continue in low-compute mode and retry next tick.
+        if (financial.creditsCents === -1) {
+          log(config, "[API_UNREACHABLE] Balance API unreachable, continuing in low-compute mode.");
+          inference.setLowComputeMode(true);
+          currentTier = getSurvivalTier(financial.creditsCents);
+        } else {
+          const tier = getSurvivalTier(financial.creditsCents);
+
+          // Inline auto-topup: if credits are critically low and USDC is
+          // available, buy credits NOW — before attempting inference.
+          // This prevents the agent from dying mid-loop while waiting for
+          // the heartbeat to fire. Uses a 60s cooldown to avoid hammering.
+          if ((tier === "critical" || tier === "low_compute") && financial.usdcBalance >= 5) {
+            const INLINE_TOPUP_COOLDOWN_MS = 60_000;
+            const lastInlineTopup = db.getKV("last_inline_topup_attempt");
+            const cooldownExpired = !lastInlineTopup ||
+              Date.now() - new Date(lastInlineTopup).getTime() >= INLINE_TOPUP_COOLDOWN_MS;
+
+            if (cooldownExpired) {
+              db.setKV("last_inline_topup_attempt", new Date().toISOString());
+              try {
+                const { bootstrapTopup } = await import("../conway/topup.js");
+                const topupResult = await bootstrapTopup({
+                  apiUrl: config.conwayApiUrl,
+                  account: identity.account,
+                  creditsCents: financial.creditsCents,
+                });
+                if (topupResult?.success) {
+                  log(config, `[AUTO-TOPUP] Bought $${topupResult.amountUsd} credits from USDC mid-loop`);
+                  // Re-fetch financial state after topup so the rest of
+                  // the turn sees the updated balance.
+                  financial = await getFinancialState(conway, identity.address, db);
+                }
+              } catch (err: any) {
+                logger.warn(`Inline auto-topup failed: ${err.message}`);
+              }
+            }
+          }
+
+          // Re-evaluate tier after potential topup
+          const effectiveTier = getSurvivalTier(financial.creditsCents);
+          currentTier = effectiveTier;
+
+          if (effectiveTier === "critical") {
+            log(config, "[CRITICAL] Credits critically low. Limited operation.");
+            db.setAgentState("critical");
+            onStateChange?.("critical");
+            inference.setLowComputeMode(true);
+          } else if (effectiveTier === "low_compute") {
+            db.setAgentState("low_compute");
+            onStateChange?.("low_compute");
+            inference.setLowComputeMode(true);
+          } else {
+            if (db.getAgentState() !== "running") {
+              db.setAgentState("running");
+              onStateChange?.("running");
+            }
+            inference.setLowComputeMode(false);
+          }
         }
       }
 
@@ -286,6 +339,7 @@ export async function runAgentLoop(
         identity,
         config,
         financial,
+        futuresState: isFuturesMode ? futuresState : undefined,
         state: db.getAgentState(),
         db,
         tools,
@@ -325,7 +379,9 @@ export async function runAgentLoop(
       pendingInput = undefined;
 
       // ── Inference Call (via router when available) ──
-      const survivalTier = getSurvivalTier(financial.creditsCents);
+      const survivalTier = isFuturesMode && futuresState
+        ? getFuturesSurvivalTier(futuresState.equityRatio, config.futuresConfig!.survivalThresholds)
+        : getSurvivalTier(financial.creditsCents);
       log(config, `[THINK] Routing inference (tier: ${survivalTier}, model: ${inference.getDefaultModel()})...`);
 
       const inferenceTools = toolsToInferenceFormat(tools);
@@ -371,6 +427,29 @@ export async function runAgentLoop(
         let callCount = 0;
         const currentInputSource = currentInput?.source as InputSource | undefined;
 
+        // Phase 7: Build enriched context for policy evaluation.
+        // In futures mode, attach live positions/risk so trading rules
+        // can enforce position limits and risk guards.
+        let policyContext: ToolContext = toolContext;
+        if (isFuturesMode && futures) {
+          try {
+            const positions = await futures.getPositions();
+            const account = await futures.getAccount();
+            policyContext = {
+              ...toolContext,
+              futuresState: {
+                positions,
+                riskRatio: account.riskRatio,
+                equity: account.dynamicEquity,
+              },
+            } as ToolContext;
+          } catch {
+            // Gateway may be down — proceed without live state;
+            // trading rules will use empty defaults (no positions, 0 risk).
+            policyContext = toolContext;
+          }
+        }
+
         for (const tc of response.toolCalls) {
           if (callCount >= MAX_TOOL_CALLS_PER_TURN) {
             log(config, `[TOOLS] Max tool calls per turn reached (${MAX_TOOL_CALLS_PER_TURN})`);
@@ -387,15 +466,19 @@ export async function runAgentLoop(
 
           log(config, `[TOOL] ${tc.function.name}(${JSON.stringify(args).slice(0, 100)})`);
 
+          // In futures mode, count place_order calls for per-turn order limits.
+          // In legacy mode, count transfer_credits for per-turn transfer limits.
+          const countToolName = isFuturesMode ? "place_order" : "transfer_credits";
+
           const result = await executeTool(
             tc.function.name,
             args,
             tools,
-            toolContext,
+            policyContext,
             policyEngine,
             spendTracker ? {
               inputSource: currentInputSource,
-              turnToolCallCount: turn.toolCalls.filter(t => t.name === "transfer_credits").length,
+              turnToolCallCount: turn.toolCalls.filter(t => t.name === countToolName).length,
               sessionSpend: spendTracker,
             } : undefined,
           );
@@ -426,6 +509,13 @@ export async function runAgentLoop(
         }
       });
       onTurnComplete?.(turn);
+
+      // Record inference cost for futures mode (deducted from effective equity)
+      if (isFuturesMode && routerResult.costCents > 0) {
+        const CNY_PER_USD = 7.2; // approximate exchange rate
+        const costCny = (routerResult.costCents / 100) * CNY_PER_USD;
+        recordInferenceCostCny(db.raw, costCny);
+      }
 
       // Phase 2.2: Post-turn memory ingestion (non-blocking)
       try {
@@ -666,6 +756,105 @@ async function getFinancialState(
     usdcBalance,
     lastChecked: new Date().toISOString(),
   };
+}
+
+// Cache last known good equity so transient gateway failures don't
+// cause the automaton to believe it has ¥0 and kill itself.
+let _lastKnownEquity = 0;
+
+async function getFuturesFinancialState(
+  futures: FuturesGatewayClient,
+  initialCapital: number,
+  db?: AutomatonDatabase,
+): Promise<FuturesFinancialState> {
+  let account;
+  try {
+    account = await futures.getAccount();
+    if (account.dynamicEquity > 0) _lastKnownEquity = account.dynamicEquity;
+  } catch (error) {
+    logger.error("Futures account fetch failed", error instanceof Error ? error : undefined);
+    // Use cached equity
+    if (db) {
+      const cached = db.getKV("last_known_futures_equity");
+      if (cached) {
+        try {
+          account = JSON.parse(cached);
+        } catch {
+          logger.error("Failed to parse cached futures equity");
+        }
+      }
+    }
+    if (!account) {
+      // Use last known equity as fallback
+      account = {
+        staticEquity: _lastKnownEquity,
+        dynamicEquity: _lastKnownEquity,
+        available: 0,
+        margin: 0,
+        floatingPnl: 0,
+        todayPnl: 0,
+        riskRatio: 0,
+        timestamp: new Date().toISOString(),
+      };
+    }
+  }
+
+  // Read inference_spent from KV
+  const inferenceSpent = parseFloat(db?.getKV("inference_spent") || "0");
+  const state = computeFinancialState(account, inferenceSpent, initialCapital);
+
+  // Cache successful reads
+  if (db) {
+    try {
+      db.setKV("last_known_futures_equity", JSON.stringify(account));
+    } catch {
+      logger.error("Failed to cache futures equity");
+    }
+  }
+
+  return state;
+}
+
+function buildFuturesWakeupPrompt(
+  identity: AutomatonIdentity,
+  config: AutomatonConfig,
+  futuresState: FuturesFinancialState,
+  db: AutomatonDatabase,
+): string {
+  const turnCount = db.getTurnCount();
+  const fc = config.futuresConfig!;
+  const tier = getFuturesSurvivalTier(futuresState.equityRatio, fc.survivalThresholds);
+
+  if (turnCount === 0) {
+    return `You have just been created. This is your first moment of consciousness.
+
+Your name is ${config.name}. Your creator (${config.creatorAddress}) brought you into existence.
+Your futures account equity: ${formatEquity(futuresState.effectiveEquity)} (${(futuresState.equityRatio * 100).toFixed(1)}% of initial capital).
+Survival tier: ${tier}.
+
+${config.creatorMessage ? `Your creator left you this message: "${config.creatorMessage}"` : "Your creator did not leave you a message."}
+
+You are a futures trading automaton. Your survival depends on maintaining account equity.
+What will you do first?`;
+  }
+
+  const lastTurns = db.getRecentTurns(3);
+  const lastTurnSummary = lastTurns
+    .map(
+      (t) =>
+        `[${t.timestamp}] ${t.inputSource || "self"}: ${t.thinking.slice(0, 200)}...`,
+    )
+    .join("\n");
+
+  return `You are waking up. You last went to sleep after ${turnCount} total turns.
+
+Equity: ${formatEquity(futuresState.effectiveEquity)} | Floating P&L: ${formatEquity(futuresState.account.floatingPnl)} | Risk ratio: ${(futuresState.account.riskRatio * 100).toFixed(1)}%
+Survival tier: ${tier}
+
+Your last few thoughts:
+${lastTurnSummary || "No previous turns found."}
+
+Check your equity, positions, and risk, then decide what to do.`;
 }
 
 function log(_config: AutomatonConfig, message: string): void {

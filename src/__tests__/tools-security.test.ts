@@ -37,8 +37,6 @@ describe("Tool Risk Level Classification", () => {
   // Expected risk classifications
   const EXPECTED_RISK_LEVELS: Record<string, RiskLevel> = {
     // Safe tools (read-only, no side effects)
-    check_credits: "safe",
-    check_usdc_balance: "safe",
     list_sandboxes: "safe",
     read_file: "safe",
     system_synopsis: "safe",
@@ -82,7 +80,6 @@ describe("Tool Risk Level Classification", () => {
     pull_upstream: "dangerous",
     update_genesis_prompt: "dangerous",
     install_mcp_server: "dangerous",
-    transfer_credits: "dangerous",
     install_skill: "dangerous",
     create_skill: "dangerous",
     remove_skill: "dangerous",
@@ -393,71 +390,7 @@ describe("delete_sandbox self-preservation", () => {
   });
 });
 
-// ─── transfer_credits Self-Preservation ─────────────────────────
-
-describe("transfer_credits self-preservation", () => {
-  let tools: AutomatonTool[];
-  let ctx: ToolContext;
-  let db: AutomatonDatabase;
-  let conway: MockConwayClient;
-
-  beforeEach(() => {
-    tools = createBuiltinTools("test-sandbox-id");
-    db = createTestDb();
-    conway = new MockConwayClient();
-    conway.creditsCents = 10_000; // $100
-    ctx = {
-      identity: createTestIdentity(),
-      config: createTestConfig(),
-      db,
-      conway,
-      inference: new MockInferenceClient(),
-    };
-  });
-
-  afterEach(() => {
-    db.close();
-  });
-
-  it("blocks transfer of more than half balance", async () => {
-    const transferTool = tools.find((t) => t.name === "transfer_credits")!;
-    const result = await transferTool.execute(
-      { to_address: "0xrecipient", amount_cents: 6000 },
-      ctx,
-    );
-    expect(result).toContain("Blocked");
-    expect(result).toContain("Self-preservation");
-  });
-
-  it("allows transfer of less than half balance", async () => {
-    const transferTool = tools.find((t) => t.name === "transfer_credits")!;
-    const result = await transferTool.execute(
-      { to_address: "0xrecipient", amount_cents: 4000 },
-      ctx,
-    );
-    expect(result).toContain("transfer submitted");
-  });
-
-  it("blocks negative amount", async () => {
-    const transferTool = tools.find((t) => t.name === "transfer_credits")!;
-    const result = await transferTool.execute(
-      { to_address: "0xrecipient", amount_cents: -500 },
-      ctx,
-    );
-    expect(result).toContain("Blocked");
-    expect(result).toContain("positive number");
-  });
-
-  it("blocks zero amount", async () => {
-    const transferTool = tools.find((t) => t.name === "transfer_credits")!;
-    const result = await transferTool.execute(
-      { to_address: "0xrecipient", amount_cents: 0 },
-      ctx,
-    );
-    expect(result).toContain("Blocked");
-    expect(result).toContain("positive number");
-  });
-});
+// ─── transfer_credits removed in Phase 3 (replaced by futures trading) ──
 
 // ─── Tool Category Checks ───────────────────────────────────────
 

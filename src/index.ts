@@ -26,7 +26,7 @@ import { initStateRepo } from "./git/state-versioning.js";
 import { createSocialClient } from "./social/client.js";
 import { PolicyEngine } from "./agent/policy-engine.js";
 import { SpendTracker } from "./agent/spend-tracker.js";
-import { createDefaultRules } from "./agent/policy-rules/index.js";
+import { createDefaultRules, createFuturesDefaultRules } from "./agent/policy-rules/index.js";
 import type { AutomatonIdentity, AgentState, Skill, SocialClientInterface } from "./types.js";
 import { DEFAULT_TREASURY_POLICY } from "./types.js";
 import { createLogger, setGlobalLogLevel } from "./observability/logger.js";
@@ -251,9 +251,11 @@ async function run(): Promise<void> {
     logger.info(`[${new Date().toISOString()}] Social relay: ${config.socialRelayUrl}`);
   }
 
-  // Initialize PolicyEngine + SpendTracker (Phase 1.4)
-  const treasuryPolicy = config.treasuryPolicy ?? DEFAULT_TREASURY_POLICY;
-  const rules = createDefaultRules(treasuryPolicy);
+  // Initialize PolicyEngine + SpendTracker (Phase 1.4 / Phase 7)
+  const isFuturesMode = !!config.futuresConfig;
+  const rules = isFuturesMode
+    ? createFuturesDefaultRules(config.futuresConfig!.tradingPolicy)
+    : createDefaultRules(config.treasuryPolicy ?? DEFAULT_TREASURY_POLICY);
   const policyEngine = new PolicyEngine(db.raw, rules);
   const spendTracker = new SpendTracker(db.raw);
 

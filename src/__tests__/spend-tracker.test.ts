@@ -14,7 +14,7 @@ import Database from "better-sqlite3";
 import path from "path";
 import os from "os";
 import fs from "fs";
-import { SpendTracker } from "../agent/spend-tracker.js";
+import { SpendTracker, recordInferenceCostCny } from "../agent/spend-tracker.js";
 import type { TreasuryPolicy, LimitCheckResult } from "../types.js";
 import { DEFAULT_TREASURY_POLICY } from "../types.js";
 
@@ -346,5 +346,73 @@ describe("SpendTracker", () => {
       const transferResult = tracker.checkLimit(200, "transfer", DEFAULT_TREASURY_POLICY);
       expect(transferResult.allowed).toBe(true);
     });
+  });
+});
+
+// ─── Futures: Inference Cost CNY Tracking ───────────────────────
+
+describe("recordInferenceCostCny", () => {
+  let db: Database.Database;
+
+  beforeEach(() => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "spend-cny-test-"));
+    const dbPath = path.join(tmpDir, "test.db");
+    db = new Database(dbPath);
+    db.pragma("journal_mode = WAL");
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS kv (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it("initializes inference_spent from zero", () => {
+    recordInferenceCostCny(db, 12.5);
+
+    const row = db.prepare("SELECT value FROM kv WHERE key = 'inference_spent'").get() as { value: string } | undefined;
+    expect(row).toBeDefined();
+    expect(parseFloat(row!.value)).toBeCloseTo(12.5);
+  });
+
+  it("accumulates inference costs across multiple calls", () => {
+    recordInferenceCostCny(db, 10);
+    recordInferenceCostCny(db, 5.5);
+    recordInferenceCostCny(db, 2.3);
+
+    const row = db.prepare("SELECT value FROM kv WHERE key = 'inference_spent'").get() as { value: string } | undefined;
+    expect(parseFloat(row!.value)).toBeCloseTo(17.8);
+  });
+
+  it("handles zero cost gracefully", () => {
+    recordInferenceCostCny(db, 0);
+
+    const row = db.prepare("SELECT value FROM kv WHERE key = 'inference_spent'").get() as { value: string } | undefined;
+    expect(row).toBeDefined();
+    expect(parseFloat(row!.value)).toBe(0);
+  });
+
+  it("preserves existing inference_spent value", () => {
+    // Pre-set a value
+    db.prepare("INSERT INTO kv (key, value) VALUES ('inference_spent', '100.0')").run();
+
+    recordInferenceCostCny(db, 25.5);
+
+    const row = db.prepare("SELECT value FROM kv WHERE key = 'inference_spent'").get() as { value: string } | undefined;
+    expect(parseFloat(row!.value)).toBeCloseTo(125.5);
+  });
+
+  it("handles negative cost gracefully (no-op for negative)", () => {
+    recordInferenceCostCny(db, 10);
+    recordInferenceCostCny(db, -5); // should be ignored
+
+    const row = db.prepare("SELECT value FROM kv WHERE key = 'inference_spent'").get() as { value: string } | undefined;
+    expect(parseFloat(row!.value)).toBeCloseTo(10);
   });
 });

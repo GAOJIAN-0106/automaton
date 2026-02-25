@@ -5,6 +5,7 @@
  */
 
 import type { PrivateKeyAccount, Address } from "viem";
+import type { FuturesConfig, FuturesGatewayClient } from "./futures/types.js";
 
 // ─── Identity ────────────────────────────────────────────────────
 
@@ -59,6 +60,8 @@ export interface AutomatonConfig {
   // Phase 2 config additions
   soulConfig?: SoulConfig;
   modelStrategy?: ModelStrategyConfig;
+  // Futures mode: replaces Credits/USDC financial layer with CTP futures
+  futuresConfig?: FuturesConfig;
 }
 
 export const DEFAULT_CONFIG: Partial<AutomatonConfig> = {
@@ -138,6 +141,7 @@ export type ToolCategory =
   | "conway"
   | "self_mod"
   | "financial"
+  | "trading"
   | "survival"
   | "skills"
   | "git"
@@ -152,6 +156,7 @@ export interface ToolContext {
   conway: ConwayClient;
   inference: InferenceClient;
   social?: SocialClientInterface;
+  futures?: FuturesGatewayClient;
 }
 
 export interface SocialClientInterface {
@@ -848,6 +853,12 @@ export interface TickContext {
   lowComputeMultiplier: number;      // from config
   config: HeartbeatConfig;
   db: import("better-sqlite3").Database;
+  // Phase 6: Futures fields (populated when in futures mode)
+  equity?: number;                   // dynamic equity (CNY)
+  effectiveEquity?: number;          // equity minus inference spent
+  riskRatio?: number;                // margin risk ratio (0-1)
+  positionCount?: number;            // number of open positions
+  isFuturesMode?: boolean;           // true when futures context is active
 }
 
 export type HeartbeatTaskFn = (
@@ -861,6 +872,7 @@ export interface HeartbeatLegacyContext {
   db: AutomatonDatabase;
   conway: ConwayClient;
   social?: SocialClientInterface;
+  futures?: import("./futures/types.js").FuturesGatewayClient;
 }
 
 export interface HeartbeatScheduleRow {

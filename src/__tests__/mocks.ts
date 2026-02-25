@@ -26,6 +26,17 @@ import type {
   InboxMessage,
 } from "../types.js";
 import { DEFAULT_CONFIG } from "../types.js";
+import type {
+  FuturesAccount,
+  FuturesGatewayClient,
+  FuturesPosition,
+  OrderRequest,
+  OrderResult,
+  MarketSnapshot,
+  KlineBar,
+  KlineInterval,
+  PositionDirection,
+} from "../futures/types.js";
 import path from "path";
 import os from "os";
 import fs from "fs";
@@ -288,6 +299,103 @@ export class MockLogger {
 
   reset(): void {
     this.logs = [];
+  }
+}
+
+// ─── Mock Futures Client ────────────────────────────────────────
+
+export class MockFuturesClient implements FuturesGatewayClient {
+  account: FuturesAccount = {
+    staticEquity: 1_000_000,
+    dynamicEquity: 1_000_000,
+    available: 800_000,
+    margin: 200_000,
+    floatingPnl: 0,
+    todayPnl: 0,
+    riskRatio: 0.2,
+    timestamp: new Date().toISOString(),
+  };
+  positions: FuturesPosition[] = [];
+  connected = true;
+
+  async getAccount(): Promise<FuturesAccount> {
+    if (!this.connected) throw new Error("CTP Gateway disconnected");
+    return { ...this.account };
+  }
+
+  async getPositions(): Promise<FuturesPosition[]> {
+    return [...this.positions];
+  }
+
+  async placeOrder(_order: OrderRequest): Promise<OrderResult> {
+    return {
+      success: true,
+      orderId: `order_${Date.now()}`,
+      status: "filled",
+      filledVolume: 1,
+      filledPrice: 5000,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  async cancelOrder(_orderId: string): Promise<{ success: boolean; error?: string }> {
+    return { success: true };
+  }
+
+  async closePosition(
+    _instrumentId: string,
+    _direction: PositionDirection,
+    _volume?: number,
+  ): Promise<OrderResult> {
+    return {
+      success: true,
+      orderId: `close_${Date.now()}`,
+      status: "filled",
+      filledVolume: 1,
+      filledPrice: 5000,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  async closeAllPositions(): Promise<OrderResult[]> {
+    return [];
+  }
+
+  async getMarketSnapshot(_instrumentId: string): Promise<MarketSnapshot> {
+    return {
+      instrumentId: "IF2403",
+      lastPrice: 5000,
+      bidPrice: 4999,
+      bidVolume: 10,
+      askPrice: 5001,
+      askVolume: 10,
+      openPrice: 4990,
+      highPrice: 5050,
+      lowPrice: 4980,
+      preClosePrice: 4985,
+      upperLimit: 5500,
+      lowerLimit: 4500,
+      volume: 10000,
+      turnover: 50_000_000,
+      openInterest: 5000,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  async getKline(
+    _instrumentId: string,
+    _interval: KlineInterval,
+    _limit?: number,
+  ): Promise<KlineBar[]> {
+    return [];
+  }
+
+  async getPnl(): Promise<{ todayPnl: number; floatingPnl: number; totalPnl: number }> {
+    return { todayPnl: 0, floatingPnl: this.account.floatingPnl, totalPnl: 0 };
+  }
+
+  async isConnected(): Promise<boolean> {
+    return this.connected;
   }
 }
 

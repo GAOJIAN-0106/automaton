@@ -552,7 +552,7 @@ describe("Tool risk classifications", () => {
   it("classifies safe tools correctly", () => {
     const tools = createBuiltinTools("test-sandbox-id");
     const expectedSafe = [
-      "read_file", "check_credits", "check_usdc_balance", "list_sandboxes",
+      "read_file", "list_sandboxes",
       "list_models", "system_synopsis", "list_skills", "list_children",
       "check_child_status", "git_status", "git_diff", "git_log",
       "check_reputation", "discover_agents", "heartbeat_ping",
@@ -570,7 +570,7 @@ describe("Tool risk classifications", () => {
     const expectedDangerous = [
       "edit_own_file", "pull_upstream", "install_npm_package",
       "install_mcp_server", "install_skill", "create_skill", "remove_skill",
-      "transfer_credits", "fund_child", "x402_fetch", "register_domain",
+      "fund_child", "register_domain",
       "spawn_child", "delete_sandbox", "update_genesis_prompt",
       "register_erc8004", "give_feedback", "distress_signal",
     ];
@@ -599,7 +599,7 @@ describe("Tool call IDs", () => {
       inference,
     };
 
-    const result = await executeTool("check_credits", {}, tools, context);
+    const result = await executeTool("system_synopsis", {}, tools, context);
 
     // ULID is 26 chars, base32 encoded
     expect(result.id).toHaveLength(26);
@@ -661,7 +661,7 @@ describe("executeTool with PolicyEngine", () => {
     };
 
     const result = await executeTool(
-      "check_credits",
+      "system_synopsis",
       {},
       tools,
       context,
@@ -690,10 +690,10 @@ describe("executeTool with PolicyEngine", () => {
     };
 
     // No policyEngine or turnContext - backward compatible
-    const result = await executeTool("check_credits", {}, tools, context);
+    const result = await executeTool("system_synopsis", {}, tools, context);
 
     expect(result.error).toBeUndefined();
-    expect(result.result).toContain("Credit balance");
+    expect(result.result).toContain("SYSTEM SYNOPSIS");
   });
 
   it("allows tool execution when policy allows", async () => {
@@ -720,7 +720,7 @@ describe("executeTool with PolicyEngine", () => {
     };
 
     const result = await executeTool(
-      "check_credits",
+      "system_synopsis",
       {},
       tools,
       context,
@@ -729,6 +729,6 @@ describe("executeTool with PolicyEngine", () => {
     );
 
     expect(result.error).toBeUndefined();
-    expect(result.result).toContain("Credit balance");
+    expect(result.result).toContain("SYSTEM SYNOPSIS");
   });
 });

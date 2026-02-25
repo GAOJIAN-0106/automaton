@@ -21,6 +21,7 @@ import type {
   HeartbeatLegacyContext,
   SocialClientInterface,
 } from "../types.js";
+import type { FuturesGatewayClient } from "../futures/types.js";
 import { BUILTIN_TASKS } from "./tasks.js";
 import { DurableScheduler } from "./scheduler.js";
 import { upsertHeartbeatSchedule } from "../state/database.js";
@@ -39,6 +40,7 @@ export interface HeartbeatDaemonOptions {
   rawDb: DatabaseType;
   conway: ConwayClient;
   social?: SocialClientInterface;
+  futures?: FuturesGatewayClient;
   onWakeRequest?: (reason: string) => void;
 }
 
@@ -58,7 +60,7 @@ export interface HeartbeatDaemon {
 export function createHeartbeatDaemon(
   options: HeartbeatDaemonOptions,
 ): HeartbeatDaemon {
-  const { identity, config, heartbeatConfig, db, rawDb, conway, social, onWakeRequest } = options;
+  const { identity, config, heartbeatConfig, db, rawDb, conway, social, futures, onWakeRequest } = options;
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   let running = false;
 
@@ -68,6 +70,7 @@ export function createHeartbeatDaemon(
     db,
     conway,
     social,
+    futures,
   };
 
   // Build task map from BUILTIN_TASKS
@@ -156,7 +159,7 @@ export function createHeartbeatDaemon(
 
   const forceRun = async (taskName: string): Promise<void> => {
     const context = await import("./tick-context.js").then((m) =>
-      m.buildTickContext(rawDb, conway, heartbeatConfig, identity.address),
+      m.buildTickContext(rawDb, conway, heartbeatConfig, identity.address, futures, config),
     );
     await scheduler.executeTask(taskName, context);
   };

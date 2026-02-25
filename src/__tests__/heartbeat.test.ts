@@ -10,6 +10,7 @@ import { BUILTIN_TASKS } from "../heartbeat/tasks.js";
 import {
   MockConwayClient,
   MockSocialClient,
+  MockFuturesClient,
   createTestDb,
   createTestIdentity,
   createTestConfig,
@@ -505,6 +506,399 @@ describe("Heartbeat Tasks", () => {
 
       // No direct getCreditsBalance calls should have been made by these tasks
       // (conway.getCreditsBalance is only called during buildTickContext, not by tasks)
+    });
+  });
+
+  // ─── Phase 6: Futures Heartbeat Tasks ─────────────────────
+
+  describe("check_equity", () => {
+    it("returns shouldWake false when not in futures mode", async () => {
+      const tickCtx = createMockTickContext(db);
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+      };
+
+      const result = await BUILTIN_TASKS.check_equity(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(false);
+    });
+
+    it("records equity check and does not wake when tier unchanged", async () => {
+      const tickCtx = createMockTickContext(db, {
+        isFuturesMode: true,
+        equity: 1_000_000,
+        effectiveEquity: 950_000,
+        riskRatio: 0.2,
+        survivalTier: "normal",
+      });
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+      };
+
+      // Set previous tier to same
+      db.setKV("prev_equity_tier", "normal");
+
+      const result = await BUILTIN_TASKS.check_equity(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(false);
+      const check = JSON.parse(db.getKV("last_equity_check")!);
+      expect(check.equity).toBe(1_000_000);
+      expect(check.effectiveEquity).toBe(950_000);
+      expect(check.tier).toBe("normal");
+    });
+
+    it("wakes when tier drops", async () => {
+      const tickCtx = createMockTickContext(db, {
+        isFuturesMode: true,
+        equity: 400_000,
+        effectiveEquity: 350_000,
+        riskRatio: 0.5,
+        survivalTier: "critical",
+      });
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+      };
+
+      // Previous tier was normal
+      db.setKV("prev_equity_tier", "normal");
+
+      const result = await BUILTIN_TASKS.check_equity(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(true);
+      expect(result.message).toContain("dropped");
+      expect(result.message).toContain("normal");
+      expect(result.message).toContain("critical");
+    });
+
+    it("does not wake on first run (no previous tier)", async () => {
+      const tickCtx = createMockTickContext(db, {
+        isFuturesMode: true,
+        equity: 400_000,
+        effectiveEquity: 350_000,
+        riskRatio: 0.5,
+        survivalTier: "critical",
+      });
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+      };
+
+      const result = await BUILTIN_TASKS.check_equity(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(false);
+    });
+
+    it("wakes and records halt notice on dead tier", async () => {
+      const tickCtx = createMockTickContext(db, {
+        isFuturesMode: true,
+        equity: 100_000,
+        effectiveEquity: 50_000,
+        riskRatio: 0.9,
+        survivalTier: "dead",
+      });
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+      };
+
+      const result = await BUILTIN_TASKS.check_equity(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(true);
+      expect(result.message).toContain("Dead tier");
+      expect(result.message).toContain("halted");
+
+      const notice = JSON.parse(db.getKV("equity_dead_notice")!);
+      expect(notice.effectiveEquity).toBe(50_000);
+    });
+
+    it("does not wake when tier improves", async () => {
+      const tickCtx = createMockTickContext(db, {
+        isFuturesMode: true,
+        equity: 1_200_000,
+        effectiveEquity: 1_100_000,
+        riskRatio: 0.1,
+        survivalTier: "high",
+      });
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+      };
+
+      // Previous tier was lower
+      db.setKV("prev_equity_tier", "normal");
+
+      const result = await BUILTIN_TASKS.check_equity(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(false);
+    });
+  });
+
+  describe("check_positions", () => {
+    it("returns shouldWake false when not in futures mode", async () => {
+      const tickCtx = createMockTickContext(db);
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+      };
+
+      const result = await BUILTIN_TASKS.check_positions(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(false);
+    });
+
+    it("records position data without waking on small P&L", async () => {
+      const futures = new MockFuturesClient();
+      futures.positions = [
+        {
+          instrumentId: "IF2403",
+          direction: "long",
+          volume: 1,
+          openPrice: 5000,
+          currentPrice: 5010,
+          floatingPnl: 3000,
+          margin: 100_000,
+          openDate: new Date().toISOString(),
+        },
+      ];
+
+      const tickCtx = createMockTickContext(db, {
+        isFuturesMode: true,
+        equity: 1_000_000,
+        effectiveEquity: 950_000,
+        riskRatio: 0.2,
+      });
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+        futures,
+      };
+
+      const result = await BUILTIN_TASKS.check_positions(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(false);
+      const check = JSON.parse(db.getKV("last_position_check")!);
+      expect(check.positionCount).toBe(1);
+    });
+
+    it("wakes on large floating loss exceeding 10% of equity", async () => {
+      const futures = new MockFuturesClient();
+      futures.account.floatingPnl = -150_000;
+      futures.positions = [
+        {
+          instrumentId: "IF2403",
+          direction: "long",
+          volume: 2,
+          openPrice: 5000,
+          currentPrice: 4700,
+          floatingPnl: -150_000,
+          margin: 200_000,
+          openDate: new Date().toISOString(),
+        },
+      ];
+
+      const tickCtx = createMockTickContext(db, {
+        isFuturesMode: true,
+        equity: 1_000_000,
+        effectiveEquity: 850_000,
+        riskRatio: 0.3,
+      });
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+        futures,
+      };
+
+      const result = await BUILTIN_TASKS.check_positions(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(true);
+      expect(result.message).toContain("floating loss");
+      expect(result.message).toContain("15.0%");
+    });
+
+    it("returns shouldWake false when no futures client", async () => {
+      const tickCtx = createMockTickContext(db, {
+        isFuturesMode: true,
+        equity: 1_000_000,
+      });
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+        // no futures client
+      };
+
+      const result = await BUILTIN_TASKS.check_positions(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(false);
+    });
+
+    it("does not wake on positive floating P&L", async () => {
+      const futures = new MockFuturesClient();
+      futures.account.floatingPnl = 200_000;
+
+      const tickCtx = createMockTickContext(db, {
+        isFuturesMode: true,
+        equity: 1_200_000,
+        effectiveEquity: 1_150_000,
+        riskRatio: 0.15,
+      });
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+        futures,
+      };
+
+      const result = await BUILTIN_TASKS.check_positions(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(false);
+    });
+  });
+
+  describe("risk_monitor", () => {
+    it("returns shouldWake false when not in futures mode", async () => {
+      const tickCtx = createMockTickContext(db);
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+      };
+
+      const result = await BUILTIN_TASKS.risk_monitor(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(false);
+    });
+
+    it("does not wake when risk ratio below warning threshold", async () => {
+      const tickCtx = createMockTickContext(db, {
+        isFuturesMode: true,
+        riskRatio: 0.3,
+        positionCount: 2,
+      });
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+      };
+
+      const result = await BUILTIN_TASKS.risk_monitor(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(false);
+      const check = JSON.parse(db.getKV("last_risk_check")!);
+      expect(check.riskRatio).toBe(0.3);
+    });
+
+    it("wakes on critical risk ratio (>=80%)", async () => {
+      const tickCtx = createMockTickContext(db, {
+        isFuturesMode: true,
+        riskRatio: 0.85,
+        positionCount: 3,
+      });
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+      };
+
+      const result = await BUILTIN_TASKS.risk_monitor(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(true);
+      expect(result.message).toContain("Critical risk ratio");
+      expect(result.message).toContain("85.0%");
+    });
+
+    it("wakes on warning risk ratio (>=60%) with cooldown", async () => {
+      const tickCtx = createMockTickContext(db, {
+        isFuturesMode: true,
+        riskRatio: 0.65,
+        positionCount: 2,
+      });
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+      };
+
+      // First time — should wake
+      const result1 = await BUILTIN_TASKS.risk_monitor(tickCtx, taskCtx);
+      expect(result1.shouldWake).toBe(true);
+      expect(result1.message).toContain("warning");
+
+      // Second time immediately — should NOT wake (cooldown)
+      const result2 = await BUILTIN_TASKS.risk_monitor(tickCtx, taskCtx);
+      expect(result2.shouldWake).toBe(false);
+    });
+
+    it("always wakes on critical even during warning cooldown", async () => {
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+      };
+
+      // First: trigger warning cooldown
+      const warningCtx = createMockTickContext(db, {
+        isFuturesMode: true,
+        riskRatio: 0.65,
+        positionCount: 2,
+      });
+      await BUILTIN_TASKS.risk_monitor(warningCtx, taskCtx);
+
+      // Now critical — should still wake regardless of warning cooldown
+      const criticalCtx = createMockTickContext(db, {
+        isFuturesMode: true,
+        riskRatio: 0.9,
+        positionCount: 2,
+      });
+      const result = await BUILTIN_TASKS.risk_monitor(criticalCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(true);
+      expect(result.message).toContain("Critical");
+    });
+
+    it("returns shouldWake false when riskRatio is undefined", async () => {
+      const tickCtx = createMockTickContext(db, {
+        isFuturesMode: true,
+        riskRatio: undefined,
+      });
+      const taskCtx: HeartbeatLegacyContext = {
+        identity: createTestIdentity(),
+        config: createTestConfig(),
+        db,
+        conway,
+      };
+
+      const result = await BUILTIN_TASKS.risk_monitor(tickCtx, taskCtx);
+
+      expect(result.shouldWake).toBe(false);
     });
   });
 });
