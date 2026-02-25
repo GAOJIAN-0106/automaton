@@ -31,14 +31,14 @@ class CtpConfig(BaseModel):
     use_openctp: bool = True
 
 
-# OpenCTP TTS addresses (7x24 available)
+# OpenCTP TTS addresses (updated 2025)
 OPENCTP_TTS_ADDRESSES = {
     "7x24": {
-        "td": "tcp://121.37.80.177:20002",
-        "md": "tcp://121.37.80.177:20004",
+        "td": "tcp://122.51.136.165:20002",
+        "md": "tcp://122.51.136.165:20004",
     },
     "sim": {
-        "td": "tcp://121.37.80.177:20002",
-        "md": "tcp://121.37.80.177:20004",
+        "td": "tcp://121.36.146.182:20002",
+        "md": "tcp://121.36.146.182:20004",
     },
 }

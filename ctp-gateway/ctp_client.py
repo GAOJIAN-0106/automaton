@@ -49,13 +49,16 @@ except ImportError:
     logger.warning("openctp-ctp not installed, running in mock mode")
 
 
-class CtpTraderSpi:
+class CtpTraderSpi(tdapi.CThostFtdcTraderSpi if CTP_AVAILABLE else object):
     """
     CTP Trader callback handler (SPI).
     Collects responses and signals completion via asyncio Events.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, config: CtpConfig) -> None:
+        if CTP_AVAILABLE:
+            super().__init__()
+        self._config = config
         self.connected = False
         self.logged_in = False
         self.front_id: int = 0
@@ -74,9 +77,32 @@ class CtpTraderSpi:
         self._position_event = asyncio.Event()
         self._order_event = asyncio.Event()
 
+        # Reference to API set by CtpClient after RegisterSpi
+        self._td_api = None
+
     def OnFrontConnected(self) -> None:
         self.connected = True
-        logger.info("CTP front connected")
+        logger.info("CTP front connected, sending auth request...")
+        if self._td_api:
+            req = tdapi.CThostFtdcReqAuthenticateField()
+            req.BrokerID = self._config.broker_id
+            req.UserID = self._config.user_id
+            req.AppID = self._config.app_id
+            req.AuthCode = self._config.auth_code
+            self._td_api.ReqAuthenticate(req, 0)
+
+    def OnRspAuthenticate(self, pRspAuthenticate, pRspInfo, nRequestID, bIsLast) -> None:
+        if pRspInfo and pRspInfo.ErrorID != 0:
+            logger.error(f"Auth failed: [{pRspInfo.ErrorID}] {pRspInfo.ErrorMsg}")
+            self._login_event.set()
+            return
+        logger.info("CTP auth OK, sending login request...")
+        if self._td_api:
+            req = tdapi.CThostFtdcReqUserLoginField()
+            req.BrokerID = self._config.broker_id
+            req.UserID = self._config.user_id
+            req.Password = self._config.password
+            self._td_api.ReqUserLogin(req, 1)
 
     def OnFrontDisconnected(self, nReason: int) -> None:
         self.connected = False
@@ -209,8 +235,9 @@ class CtpClient:
             os.path.join(flow_path, "trader")
         )
 
-        self._spi = CtpTraderSpi()
+        self._spi = CtpTraderSpi(self.config)
         self._td_api.RegisterSpi(self._spi)
+        self._spi._td_api = self._td_api
         self._td_api.RegisterFront(self.config.td_address)
         self._td_api.SubscribePublicTopic(2)  # THOST_TERT_QUICK
         self._td_api.SubscribePrivateTopic(2)
@@ -232,7 +259,7 @@ class CtpClient:
 
     async def get_account(self) -> FuturesAccount:
         """Query trading account."""
-        if not CTP_AVAILABLE or self._spi is None:
+        if not self.is_connected:
             return self._mock_account()
 
         self._spi._account = None
@@ -250,7 +277,7 @@ class CtpClient:
 
     async def get_positions(self) -> list[FuturesPosition]:
         """Query all open positions."""
-        if not CTP_AVAILABLE or self._spi is None:
+        if not self.is_connected:
             return []
 
         self._spi._positions = []
@@ -266,7 +293,7 @@ class CtpClient:
 
     async def place_order(self, order: OrderRequest) -> OrderResult:
         """Submit a new order."""
-        if not CTP_AVAILABLE or self._spi is None:
+        if not self.is_connected:
             return self._mock_order_result(order)
 
         self._spi._order_result = None
@@ -313,7 +340,7 @@ class CtpClient:
 
     async def cancel_order(self, order_id: str) -> dict:
         """Cancel a pending order."""
-        if not CTP_AVAILABLE:
+        if not self.is_connected:
             return {"success": True}
 
         req = tdapi.CThostFtdcInputOrderActionField()

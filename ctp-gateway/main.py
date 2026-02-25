@@ -241,6 +241,14 @@ def main():
         use_openctp=args.use_openctp,
     )
 
+    # Apply OpenCTP TTS addresses when --use-openctp is set and no explicit addresses given
+    if config.use_openctp:
+        from config import OPENCTP_TTS_ADDRESSES
+        if not args.td_address:
+            config.td_address = OPENCTP_TTS_ADDRESSES["7x24"]["td"]
+        if not args.md_address:
+            config.md_address = OPENCTP_TTS_ADDRESSES["7x24"]["md"]
+
     if args.td_address:
         config.td_address = args.td_address
     if args.md_address:
