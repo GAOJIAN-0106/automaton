@@ -1,36 +1,34 @@
 """
-CTP Gateway - FastAPI REST Service
+Futures Gateway - FastAPI REST Service
 
-Wraps CTP (Comprehensive Transaction Platform) into a REST API
-that the Automaton TypeScript runtime can call.
+Wraps TqSdk (天勤量化) into a REST API that the Automaton
+TypeScript runtime can call.
 
 Endpoints:
-  GET  /health           - Gateway health check
-  GET  /account          - Query account equity and margin
-  GET  /positions        - List open positions
-  POST /orders           - Place a new order
-  DELETE /orders/{id}    - Cancel a pending order
-  POST /orders/{id}/close - Close a specific position
+  GET  /health              - Gateway health check
+  GET  /account             - Query account equity and margin
+  GET  /positions           - List open positions
+  POST /orders              - Place a new order
+  DELETE /orders/{id}       - Cancel a pending order
+  POST /orders/{id}/close   - Close a specific position
   POST /positions/close-all - Close all positions
   GET  /market/{instrument} - Market snapshot
-  GET  /pnl              - Today's P&L summary
+  GET  /pnl                 - Today's P&L summary
 
 Usage:
-  python main.py                    # Start with default config
-  python main.py --port 8400        # Custom port
-  python main.py --user-id XXXXX    # SimNow user ID
+  python main.py                          # Start with default config
+  python main.py --port 8400              # Custom port
+  python main.py --user-id 18721807537    # TqAuth phone number
 """
 
 import argparse
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 
-from config import CtpConfig
-from ctp_client import CtpClient
+from config import TqConfig
+from tq_client import TqClient
 from models import (
     ClosePositionRequest,
     FuturesAccount,
@@ -45,31 +43,34 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
-logger = logging.getLogger("ctp-gateway")
+logger = logging.getLogger("futures-gateway")
 
-# Global CTP client instance
-ctp_client: CtpClient | None = None
+# Global client instance
+client: TqClient | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Connect to CTP on startup, disconnect on shutdown."""
-    global ctp_client
-    if ctp_client:
-        logger.info("Connecting to CTP...")
-        ok = await ctp_client.connect()
+    """Connect to TqSdk on startup, disconnect on shutdown."""
+    global client
+    if client:
+        logger.info("Connecting to TqSdk...")
+        ok = await client.connect()
         if ok:
-            logger.info("CTP connected successfully")
+            logger.info("TqSdk connected successfully")
         else:
-            logger.error("CTP connection failed, running in degraded mode")
+            logger.error("TqSdk connection failed, running in degraded mode")
     yield
-    logger.info("CTP Gateway shutting down")
+    if client:
+        logger.info("Disconnecting TqSdk...")
+        await client.disconnect()
+    logger.info("Futures Gateway shutting down")
 
 
 app = FastAPI(
-    title="CTP Gateway",
-    description="REST API bridge for CTP futures trading",
-    version="0.1.0",
+    title="Futures Gateway",
+    description="REST API bridge for TqSdk futures trading",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -79,7 +80,7 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
-    connected = ctp_client.is_connected if ctp_client else False
+    connected = client.is_connected if client else False
     return {"connected": connected, "status": "ok" if connected else "degraded"}
 
 
@@ -88,10 +89,10 @@ async def health():
 
 @app.get("/account", response_model=FuturesAccount)
 async def get_account():
-    if not ctp_client:
-        raise HTTPException(503, "CTP client not initialized")
+    if not client:
+        raise HTTPException(503, "Client not initialized")
     try:
-        return await ctp_client.get_account()
+        return await client.get_account()
     except Exception as e:
         raise HTTPException(500, f"Account query failed: {e}")
 
@@ -101,10 +102,10 @@ async def get_account():
 
 @app.get("/positions", response_model=list[FuturesPosition])
 async def get_positions():
-    if not ctp_client:
-        raise HTTPException(503, "CTP client not initialized")
+    if not client:
+        raise HTTPException(503, "Client not initialized")
     try:
-        return await ctp_client.get_positions()
+        return await client.get_positions()
     except Exception as e:
         raise HTTPException(500, f"Position query failed: {e}")
 
@@ -114,20 +115,20 @@ async def get_positions():
 
 @app.post("/orders", response_model=OrderResult)
 async def place_order(order: OrderRequest):
-    if not ctp_client:
-        raise HTTPException(503, "CTP client not initialized")
+    if not client:
+        raise HTTPException(503, "Client not initialized")
     try:
-        return await ctp_client.place_order(order)
+        return await client.place_order(order)
     except Exception as e:
         raise HTTPException(500, f"Order placement failed: {e}")
 
 
 @app.delete("/orders/{order_id}")
 async def cancel_order(order_id: str):
-    if not ctp_client:
-        raise HTTPException(503, "CTP client not initialized")
+    if not client:
+        raise HTTPException(503, "Client not initialized")
     try:
-        return await ctp_client.cancel_order(order_id)
+        return await client.cancel_order(order_id)
     except Exception as e:
         raise HTTPException(500, f"Order cancellation failed: {e}")
 
@@ -135,11 +136,11 @@ async def cancel_order(order_id: str):
 @app.post("/orders/{instrument_id}/close", response_model=OrderResult)
 async def close_position(instrument_id: str, req: ClosePositionRequest):
     """Close a specific position by instrument and direction."""
-    if not ctp_client:
-        raise HTTPException(503, "CTP client not initialized")
+    if not client:
+        raise HTTPException(503, "Client not initialized")
 
-    # Build a close order from the position info
-    positions = await ctp_client.get_positions()
+    # Find the matching position
+    positions = await client.get_positions()
     matching = [
         p for p in positions
         if p.instrumentId == instrument_id and p.direction == req.direction
@@ -160,7 +161,7 @@ async def close_position(instrument_id: str, req: ClosePositionRequest):
     )
 
     try:
-        return await ctp_client.place_order(order)
+        return await client.place_order(order)
     except Exception as e:
         raise HTTPException(500, f"Close position failed: {e}")
 
@@ -168,10 +169,10 @@ async def close_position(instrument_id: str, req: ClosePositionRequest):
 @app.post("/positions/close-all", response_model=list[OrderResult])
 async def close_all_positions():
     """Close all open positions."""
-    if not ctp_client:
-        raise HTTPException(503, "CTP client not initialized")
+    if not client:
+        raise HTTPException(503, "Client not initialized")
 
-    positions = await ctp_client.get_positions()
+    positions = await client.get_positions()
     results: list[OrderResult] = []
 
     for pos in positions:
@@ -183,7 +184,7 @@ async def close_all_positions():
             volume=pos.volume,
         )
         try:
-            result = await ctp_client.place_order(order)
+            result = await client.place_order(order)
             results.append(result)
         except Exception as e:
             logger.error(f"Failed to close {pos.instrumentId}: {e}")
@@ -196,12 +197,13 @@ async def close_all_positions():
 
 @app.get("/market/{instrument_id}", response_model=MarketSnapshot)
 async def get_market_snapshot(instrument_id: str):
-    """Get latest market data for an instrument.
-
-    Note: Full market data subscription requires the MD API (mdapi).
-    This is a placeholder that returns cached data or raises 501.
-    """
-    raise HTTPException(501, "Market data subscription not yet implemented. Use CTP MD API.")
+    """Get latest market data for an instrument."""
+    if not client:
+        raise HTTPException(503, "Client not initialized")
+    try:
+        return await client.get_market_snapshot(instrument_id)
+    except Exception as e:
+        raise HTTPException(500, f"Market data failed: {e}")
 
 
 # ─── P&L ────────────────────────────────────────────────────────
@@ -209,10 +211,10 @@ async def get_market_snapshot(instrument_id: str):
 
 @app.get("/pnl", response_model=PnlSummary)
 async def get_pnl():
-    if not ctp_client:
-        raise HTTPException(503, "CTP client not initialized")
+    if not client:
+        raise HTTPException(503, "Client not initialized")
     try:
-        return await ctp_client.get_pnl()
+        return await client.get_pnl()
     except Exception as e:
         raise HTTPException(500, f"PnL query failed: {e}")
 
@@ -221,46 +223,38 @@ async def get_pnl():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CTP Gateway REST Service")
+    parser = argparse.ArgumentParser(description="Futures Gateway REST Service")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address")
     parser.add_argument("--port", type=int, default=8400, help="Port number")
-    parser.add_argument("--broker-id", default="9999", help="CTP Broker ID")
-    parser.add_argument("--user-id", default="", help="CTP User ID (SimNow investor code)")
-    parser.add_argument("--password", default="", help="CTP Password")
-    parser.add_argument("--td-address", help="Trade server address")
-    parser.add_argument("--md-address", help="Market data server address")
-    parser.add_argument("--use-openctp", action="store_true", default=True, help="Use OpenCTP TTS")
+    parser.add_argument("--user-id", default="", help="TqAuth phone number")
+    parser.add_argument("--password", default="", help="TqAuth password")
+    parser.add_argument("--balance", type=float, default=10_000_000, help="TqSim initial balance")
+    parser.add_argument(
+        "--instruments",
+        nargs="*",
+        default=[],
+        help="Instruments to subscribe on startup (e.g., SHFE.rb2510 DCE.m2509)",
+    )
     args = parser.parse_args()
 
-    config = CtpConfig(
-        broker_id=args.broker_id,
+    config = TqConfig(
         user_id=args.user_id,
         password=args.password,
         host=args.host,
         port=args.port,
-        use_openctp=args.use_openctp,
+        initial_balance=args.balance,
+        default_instruments=args.instruments,
     )
 
-    # Apply OpenCTP TTS addresses when --use-openctp is set and no explicit addresses given
-    if config.use_openctp:
-        from config import OPENCTP_TTS_ADDRESSES
-        if not args.td_address:
-            config.td_address = OPENCTP_TTS_ADDRESSES["7x24"]["td"]
-        if not args.md_address:
-            config.md_address = OPENCTP_TTS_ADDRESSES["7x24"]["md"]
-
-    if args.td_address:
-        config.td_address = args.td_address
-    if args.md_address:
-        config.md_address = args.md_address
-
-    global ctp_client
-    ctp_client = CtpClient(config)
+    global client
+    client = TqClient(config)
 
     import uvicorn
 
-    logger.info(f"Starting CTP Gateway on {config.host}:{config.port}")
-    logger.info(f"TD: {config.td_address}, MD: {config.md_address}")
+    logger.info(f"Starting Futures Gateway on {config.host}:{config.port}")
+    logger.info(f"Sim balance: {config.initial_balance:,.0f} CNY")
+    if config.default_instruments:
+        logger.info(f"Default instruments: {', '.join(config.default_instruments)}")
     uvicorn.run(app, host=config.host, port=config.port, log_level="info")
 
 

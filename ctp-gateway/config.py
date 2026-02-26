@@ -1,44 +1,27 @@
 """
-CTP Gateway Configuration
+Gateway Configuration
 
-Supports SimNow and OpenCTP TTS environments.
+Supports TqSdk with TqSim (simulator) or live account.
 """
 
 from pydantic import BaseModel
 
 
-class CtpConfig(BaseModel):
-    """CTP connection configuration."""
+class TqConfig(BaseModel):
+    """TqSdk connection configuration."""
 
-    # Broker and user credentials
-    broker_id: str = "9999"  # SimNow default
+    # TqAuth credentials (phone number + password)
     user_id: str = ""
     password: str = ""
-    app_id: str = "simnow_client_test"
-    auth_code: str = "0000000000000000"
-
-    # Server addresses
-    # SimNow 7x24: trade=180.168.146.187:10130, md=180.168.146.187:10131
-    # OpenCTP TTS: see https://github.com/openctp/openctp for latest addresses
-    td_address: str = "tcp://180.168.146.187:10130"
-    md_address: str = "tcp://180.168.146.187:10131"
 
     # Gateway settings
     host: str = "127.0.0.1"
     port: int = 8400
 
-    # Use OpenCTP TTS instead of SimNow
-    use_openctp: bool = True
+    # Use TqSim simulator (vs real broker)
+    use_sim: bool = True
+    initial_balance: float = 10_000_000  # TqSim starting capital (CNY)
 
-
-# OpenCTP TTS addresses (updated 2025)
-OPENCTP_TTS_ADDRESSES = {
-    "7x24": {
-        "td": "tcp://122.51.136.165:20002",
-        "md": "tcp://122.51.136.165:20004",
-    },
-    "sim": {
-        "td": "tcp://121.36.146.182:20002",
-        "md": "tcp://121.36.146.182:20004",
-    },
-}
+    # Instruments to subscribe on startup (optional)
+    # e.g., ["SHFE.rb2510", "DCE.m2509", "CZCE.MA509"]
+    default_instruments: list[str] = []
