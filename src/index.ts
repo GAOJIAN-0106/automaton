@@ -29,6 +29,8 @@ import { SpendTracker } from "./agent/spend-tracker.js";
 import { createDefaultRules, createFuturesDefaultRules } from "./agent/policy-rules/index.js";
 import type { AutomatonIdentity, AgentState, Skill, SocialClientInterface } from "./types.js";
 import { DEFAULT_TREASURY_POLICY } from "./types.js";
+import { FuturesHttpClient } from "./futures/client.js";
+import type { FuturesGatewayClient } from "./futures/types.js";
 import { createLogger, setGlobalLogLevel } from "./observability/logger.js";
 import { bootstrapTopup } from "./conway/topup.js";
 
@@ -251,8 +253,16 @@ async function run(): Promise<void> {
     logger.info(`[${new Date().toISOString()}] Social relay: ${config.socialRelayUrl}`);
   }
 
-  // Initialize PolicyEngine + SpendTracker (Phase 1.4 / Phase 7)
+  // Initialize futures gateway client (if futures mode enabled)
+  let futures: FuturesGatewayClient | undefined;
   const isFuturesMode = !!config.futuresConfig;
+  if (isFuturesMode) {
+    const gwUrl = config.futuresConfig!.gatewayUrl;
+    futures = new FuturesHttpClient(gwUrl);
+    logger.info(`[${new Date().toISOString()}] Futures mode enabled, gateway: ${gwUrl}`);
+  }
+
+  // Initialize PolicyEngine + SpendTracker (Phase 1.4 / Phase 7)
   const rules = isFuturesMode
     ? createFuturesDefaultRules(config.futuresConfig!.tradingPolicy)
     : createDefaultRules(config.treasuryPolicy ?? DEFAULT_TREASURY_POLICY);
@@ -369,6 +379,7 @@ async function run(): Promise<void> {
         policyEngine,
         spendTracker,
         ollamaBaseUrl,
+        futures,
         onStateChange: (state: AgentState) => {
           logger.info(`[${new Date().toISOString()}] State: ${state}`);
         },
